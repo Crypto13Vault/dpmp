@@ -483,6 +483,8 @@ def load_config(path: str) -> AppCfg:
     else:
         v3_sr_exclusions = []
 
+    v3_downstream_keepalive = float(sched.get("downstream_keepalive_seconds", 0.0))
+
     return AppCfg(
         listen_host=str(listen_host),
         listen_port=int(listen_port),
@@ -500,7 +502,8 @@ def load_config(path: str) -> AppCfg:
                            max_slicers=v3_max_slicers,
                            pool_failover_seconds=v3_pool_failover_s,
                            force_reconnect_on_en2_mismatch=v3_force_reconnect_en2,
-                           sr_recruit_exclusions=v3_sr_exclusions),
+                           sr_recruit_exclusions=v3_sr_exclusions,
+                           downstream_keepalive_seconds=v3_downstream_keepalive),
         downstream_diff=dict(cfg.get("downstream_diff", {})),
     )
 
