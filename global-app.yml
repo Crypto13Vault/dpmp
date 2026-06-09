@@ -20,7 +20,7 @@ developer: BitaxeRMT
 website: https://github.com/Crypto13Vault/dpmp
 support: https://github.com/Crypto13Vault/dpmp/issues
 dependencies: []
-port: 8080
+port: 8845
 gallery: []
 path: ""
 defaultUsername: ""
