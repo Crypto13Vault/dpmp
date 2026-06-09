@@ -3795,24 +3795,18 @@ class ProxySession:
                     log("job_forwarded", sid=self.sid, pool=pick, jobid=jid, seq=seq)
                     log("job_forwarded_diff_state", sid=self.sid, pool=pick, jobid=jid, latest_diff=self.latest_diff.get(pick), last_dd=self.last_downstream_diff_by_pool.get(pick))
 
-            # Downstream keepalive: re-send last notify as clean_jobs=false ping
+            # Downstream keepalive: re-send current difficulty as benign ping
+            # Using mining.set_difficulty instead of mining.notify avoids resetting
+            # miner work queues and prevents duplicate-notify confusion in some firmware.
             ka = self.cfg.sched.downstream_keepalive_seconds
             if ka > 0 and (time.monotonic() - self._last_forward_mono) >= ka:
-                raw = self.latest_notify_raw.get(current_pool)
-                if raw:
-                    try:
-                        msg = loads_json(raw)
-                        if msg.get("method") == "mining.notify":
-                            params = msg.get("params") or []
-                            if len(params) >= 9:
-                                params[-1] = False
-                                msg["params"] = params
-                                await write_line(self.miner_w, dumps_json(msg), "downstream")
-                                log("downstream_keepalive", sid=self.sid, pool=current_pool,
-                                    interval=ka)
-                                self._last_forward_mono = time.monotonic()
-                    except Exception as e:
-                        log("downstream_keepalive_error", sid=self.sid, err=str(e))
+                dd = self.last_downstream_diff_by_pool.get(current_pool)
+                if dd is not None and dd > 0:
+                    msg = {"method": "mining.set_difficulty", "params": [dd]}
+                    await write_line(self.miner_w, dumps_json(msg), "downstream")
+                    log("downstream_keepalive", sid=self.sid, pool=current_pool,
+                        interval=ka)
+                    self._last_forward_mono = time.monotonic()
 
             await asyncio.sleep(0.10)
 
