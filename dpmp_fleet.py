@@ -3192,7 +3192,7 @@ async def assigner_loop(cfg):
 # Keyed by miner IP address (str), value is (pool_key, monotonic_timestamp).
 # Entries expire after _EN2_HINT_TTL_S seconds to avoid stale hints.
 _next_handshake_pool: dict[str, tuple[str, float]] = {}
-_EN2_HINT_TTL_S = 30.0  # hint expires after 30 seconds
+_EN2_HINT_TTL_S = 300.0  # hint expires after 300 seconds (Bitaxe reconnect can take >30s)
 
 # Auto-detection: miners that can't handle en2_size changes get pinned to
 # one pool (avoids wasted hashing on rejects or disconnect loops).
