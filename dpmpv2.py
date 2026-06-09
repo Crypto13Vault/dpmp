@@ -1,0 +1,4186 @@
+#!/usr/bin/env python3
+"""
+DPMP - Dual-Pool Mining Proxy (Stratum v1)
+Dual upstream + weighted scheduling, with correct miner handshake forwarding.
+Copyright (c) 2025-2026 Christopher Kryza. Subject to the MIT License.
+
+Max Miners
+- For high-end Umbrel box setup, ~50 miners per DPMP instance is reasonable.
+- For low-end Raspberry Pi setup, ~10 miners per DPMP instance is reasonable.
+- Upstream pool connection limits may apply (e.g., 20 connections max).
+- Docker container resources may limit max miners per instance.
+"""
+from __future__ import annotations
+
+import asyncio
+import itertools
+import datetime as dt
+import json
+import math
+import time
+import os
+import hashlib
+import signal
+import threading
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+try:
+    import orjson  # type: ignore
+except Exception:
+    orjson = None
+
+from prometheus_client import Counter, Gauge, start_http_server
+
+CONN_DOWNSTREAM = Gauge("dpmp_downstream_connections", "Active downstream miner connections")
+CONN_UPSTREAM = Gauge("dpmp_upstream_connections", "Active upstream pool connections", ["pool"])
+MSG_RX = Counter("dpmp_messages_rx_total", "Messages received", ["side"])
+MSG_TX = Counter("dpmp_messages_tx_total", "Messages sent", ["side"])
+SHARES_SUBMITTED = Counter("dpmp_shares_submitted_total", "Shares submitted by miners")
+SHARES_ACCEPTED = Counter("dpmp_shares_accepted_total", "Shares accepted by pools", ["pool"])
+SHARES_REJECTED = Counter("dpmp_shares_rejected_total", "Shares rejected by pools", ["pool"])
+JOBS_FORWARDED = Counter("dpmp_jobs_forwarded_total", "Jobs forwarded to miner", ["pool"])
+ACCEPTED_DIFFICULTY_SUM = Counter("dpmp_accepted_difficulty_sum", "Sum of difficulty for accepted shares", ["pool"])
+SCHEDULER_TIME_SUM = Counter("dpmp_scheduler_time_sum", "Time-based scheduler credits (seconds on pool)", ["pool"])
+SCHEDULER_SHARE = Gauge("dpmp_scheduler_share", "Per-miner scheduler time-ratio (averaged across fleet)", ["pool"])
+RATIO_WINDOW = Gauge("dpmp_ratio_window", "Rolling-window accepted-difficulty ratio", ["pool"])
+DIFF_DOWNSTREAM = Gauge("dpmp_downstream_difficulty", "Current downstream difficulty")
+ACTIVE_POOL = Gauge("dpmp_active_pool", "Active pool (1=active,0=inactive)", ["pool"])
+
+# Oracle metrics
+ORACLE_HASHRATE = Gauge("dpmp_oracle_hashrate", "Network hashrate from oracle", ["chain", "window"])
+ORACLE_RATIO = Gauge("dpmp_oracle_ratio", "Hashrate ratio (short/baseline)", ["chain"])
+ORACLE_WEIGHT = Gauge("dpmp_oracle_weight", "Oracle-calculated pool weight", ["pool"])
+ORACLE_STATUS = Gauge("dpmp_oracle_status", "Oracle status (1=healthy, 0=error)")
+ORACLE_AGE = Gauge("dpmp_oracle_data_age_seconds", "Age of oracle data in seconds")
+EN2_SIZE = Gauge("dpmp_extranonce2_size", "Extranonce2 size per pool", ["pool"])
+
+# Miner health scoring (Phase 1b of Scheduler v3)
+MINER_HEALTH = Gauge("dpmp_miner_health", "Per-miner health score (0.1-1.0)", ["worker"])
+
+
+import dpmp_fleet
+
+# Track active miner writers for clean shutdown (close all on SIGTERM/SIGINT
+# so miners disconnect and flush stale work before DPMP restarts).
+_active_miner_writers: set = set()
+
+# Path to optional weights override file (written by GUI slider, polled by scheduler)
+WEIGHTS_OVERRIDE_PATH = None  # set in main() from config path
+# Path to oracle mode file (written by GUI switch button, polled by oracle task)
+ORACLE_MODE_PATH = None       # set in main() from config path
+# Path to miner pause file (written by GUI toggle, polled by scheduler)
+MINER_PAUSED_PATH = None      # set in main() from config path
+MAX_CACHED_NOTIFY_AGE_S = 20.0  # don't switch into pool if cached notify older than this
+MAX_CONVERGE_DEVIATION = 0.05 # default max deviation (5%) to trigger urgent pool switch
+
+# Cached reader for miner_paused.json -- avoids disk I/O on every 0.1s tick.
+# Re-reads the file at most every 2 seconds.
+_paused_miners_cache: set = set()
+_paused_miners_cache_ts: float = 0.0
+
+def get_paused_miners() -> set:
+    """Return the set of paused worker names, re-reading file at most every 2s."""
+    global _paused_miners_cache, _paused_miners_cache_ts
+    now = time.monotonic()
+    if now - _paused_miners_cache_ts < 2.0:
+        return _paused_miners_cache
+    _paused_miners_cache_ts = now
+    if MINER_PAUSED_PATH is None:
+        return _paused_miners_cache
+    try:
+        with open(MINER_PAUSED_PATH, "rb") as f:
+            obj = json.loads(f.read())
+        _paused_miners_cache = set(obj.get("paused", []))
+    except FileNotFoundError:
+        _paused_miners_cache = set()
+    except Exception:
+        pass  # keep previous cache on read error
+    return _paused_miners_cache
+
+# Read weight override file if it exists (written by GUI slider)
+def read_weight_override() -> tuple[int, int] | None:
+    """Return (wA, wB) from weights_override.json, or None if file missing/invalid."""
+    if WEIGHTS_OVERRIDE_PATH is None:
+        return None
+    try:
+        with open(WEIGHTS_OVERRIDE_PATH, "rb") as f:
+            obj = json.loads(f.read())
+        wA = int(obj.get("poolA_weight", -1))
+        wB = int(obj.get("poolB_weight", -1))
+        if wA < 0 or wB < 0 or (wA == 0 and wB == 0):
+            return None
+        return (wA, wB)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def read_oracle_mode(config_auto_balance: bool) -> bool:
+    """Check whether the oracle should write weights_override.json this cycle.
+
+    Priority:
+      1. oracle_mode.json exists  -> use its "oracle_active" value
+      2. oracle_mode.json missing -> fall back to config auto_balance setting
+
+    The file is written by the GUI switch button and deleted on DPMP restart.
+
+    Args:
+        config_auto_balance: the auto_balance value from config_v2.json (startup default)
+
+    Returns:
+        True  = oracle should write weights (oracle is in control)
+        False = oracle should NOT write weights (slider is in control)
+    """
+    if ORACLE_MODE_PATH is None:
+        return config_auto_balance
+    try:
+        with open(ORACLE_MODE_PATH, "rb") as f:
+            obj = json.loads(f.read())
+        return bool(obj.get("oracle_active", True))
+    except FileNotFoundError:
+        return config_auto_balance
+    except Exception:
+        return config_auto_balance
+
+
+# Get current UTC time as ISO 8601 string
+def now_utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+LOG_LEVEL = os.environ.get("DPMP_LOG_LEVEL", "info").strip().lower()
+LOG_ALLOW = set(x.strip() for x in os.environ.get("DPMP_LOG_ALLOW", "").split(",") if x.strip())
+LOG_DENY  = set(x.strip() for x in os.environ.get("DPMP_LOG_DENY", "").split(",") if x.strip())
+
+# Events considered "debug" level (verbose / high-output).
+# Filtered out when LOG_LEVEL is "normal" or "info".
+# Logged when LOG_LEVEL is "full" or "debug".
+# LOG_LEVEL "none"/"off"/"quiet" suppresses ALL events.
+_DEBUG_EVENTS = {
+    # Per-share / per-job routing (very high volume)
+    "downstream_tx", "upstream_tx", "miner_method",
+    "submit_snapshot", "submit_local_sanity", "submit_route",
+    "job_forwarded", "job_forwarded_diff_state",
+    "share_result",
+    # Downstream notifications and difficulty changes
+    "downstream_send_notify", "downstream_send_raw",
+    "downstream_send_diff", "downstream_send_extranonce",
+    "downstream_notify_flushed_after_subscribe",
+    # Extranonce plumbing
+    "downstream_extranonce_check", "downstream_extranonce_set",
+    "downstream_extranonce_skip_already_in_subscribe",
+    "downstream_extranonce_skip_no_data",
+    "downstream_extranonce_skip_nochange",
+    "downstream_extranonce_skip_raw_subscribe",
+    # Pool notifications
+    "pool_notify",
+    # Subscribe / authorize handshake internals
+    "authorize_rewrite", "authorize_rewrite_other",
+    "authorize_rewrite_secondary",
+    "bootstrap_reconnect_forced", "bootstrap_skipped_handshake_pool",
+    "handshake_pool_en2_prefer_smaller", "handshake_response_dropped",
+    "id_response_seen", "subscribe_result",
+    "subscribe_id_response_skipped_duplicate",
+    "downstream_subscribe_forwarded_raw",
+    "configure_forwarded_both_pools",
+    # Difficulty coalescing
+    "diff_coalesce_suppressed_pct", "diff_coalesce_suppressed_time",
+    # Post-auth setup
+    "post_auth_downstream_sync",
+    "post_auth_extranonce_skip_already_in_subscribe",
+    "post_auth_extranonce_skip_raw_subscribe",
+    "post_auth_push_diff", "post_auth_push_extranonce",
+    "post_auth_push_notify_clean",
+    # Oracle polling details
+    "oracle_calc_result", "oracle_data_age", "oracle_mode_slider",
+    "oracle_next_poll", "oracle_override_written",
+    "oracle_poll_start", "oracle_weights_applied",
+    # Scheduler tick (every 0.1s when active)
+    "scheduler_tick",
+    # Upstream queue / flush
+    "send_upstream_flush_done", "send_upstream_flush_start",
+    "send_upstream_queued",
+    # Pruning
+    "prune_internal_ids", "prune_job_owner",
+    "prune_seen_upstream_ids", "prune_submit_owner",
+    # VarDiff suppression (per-reject)
+    "vardiff_ramp_suppress",
+    "reject_suppressed_vardiff",
+    # Upstream response dedup
+    "upstream_response_dup_observed",
+    # No-cached-job / reconnect (high volume during pool outage)
+    "switch_skipped_no_cached_job",
+    "pool_no_job_rearm_reconnect",
+    # Null-error reject diagnostics (per-reject)
+    "null_error_reject_diag",
+    "null_error_reject_suppressed_startup",
+}
+
+# Structured logging function
+def log(event: str, **fields: Any) -> None:
+    # Allowlist/denylist first (highest priority, for advanced users)
+    if LOG_ALLOW and event not in LOG_ALLOW:
+        return
+    if LOG_DENY and event in LOG_DENY:
+        return
+
+    # Level-based filtering
+    # "none"/"off"/"quiet" -> suppress ALL events
+    # "normal"/"info"      -> suppress _DEBUG_EVENTS (verbose/high-volume)
+    # "full"/"debug"       -> log everything
+    if LOG_LEVEL in ("quiet", "off", "none"):
+        return
+    if LOG_LEVEL in ("info", "normal", "warn", "warning", "error"):
+        if event in _DEBUG_EVENTS:
+            return
+
+    rec = {"ts": now_utc(), "event": event, **fields}
+    print(json.dumps(rec, separators=(",", ":"), ensure_ascii=False), flush=True)
+
+# JSON load/dump helpers with orjson if available
+def loads_json(b: bytes) -> Dict[str, Any]:
+    if orjson is not None:
+        return orjson.loads(b)
+    return json.loads(b.decode("utf-8", errors="replace"))
+
+# JSON dump helper with orjson if available
+def dumps_json(obj: Dict[str, Any]) -> bytes:
+    # Ensure Stratum responses include "error": null when "id" is non-null.
+    # Some miners disconnect if "error" is missing from {"id":..., "result":...} responses.
+    if isinstance(obj, dict) and obj.get("id") is not None and "result" in obj and "error" not in obj:
+        obj = dict(obj)
+        obj["error"] = None
+    if orjson is not None:
+        return orjson.dumps(obj) + b"\n"
+    return (json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+
+# Sanitize downstream notification (remove JSON-RPC 2.0 fields)
+def sanitize_downstream_notification(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Stratum v1 pool->miner notifications should NOT include JSON-RPC 2.0 fields.
+    Many miners are picky: omit "jsonrpc" and omit "id" (no id:null).
+    """
+    if not isinstance(msg, dict):
+        return msg
+    if msg.get("method") is None:
+        return msg
+    m = dict(msg)
+    m.pop("jsonrpc", None)
+    m.pop("id", None)
+    return m
+
+# Extract worker name from miner 'user' string
+def extract_worker_name(user: str) -> str:
+    """
+    Accepts miner 'user' strings like:
+      - wallet.worker
+      - wallet.worker.suffix
+      - worker
+    Returns a worker name used internally for metrics and upstream worker tagging.
+    """
+    if not user:
+        return "unknown"
+    u = user.strip()
+    # take last token after '.' if present
+    if "." in u:
+        last = u.rsplit(".", 1)[-1].strip()
+        if last:
+            return last
+    return u
+
+
+@dataclass
+class PoolCfg:
+    key: str
+    name: str
+    host: str
+    port: int
+    wallet: str
+    chain: str = ""
+    idle_disconnect: bool = False  # True if pool disconnects idle connections (e.g. MiningCore ~10min timeout)
+
+
+@dataclass
+class SchedulerCfg:
+    wA: int
+    wB: int
+    slice_seconds: int
+    auto_balance: bool = False
+    auto_balance_max_deviation: int = 20
+    oracle_url: str = "https://www.sr-analyst.com/dpmp/oracle.php"
+    oracle_poll_seconds: int = 600
+    # v3 scheduler fields -- read from config with safe defaults,
+    # silently ignored if not present in existing config files.
+    min_slice_seconds: float = 10.0       # floor for any single pool stay
+    assigner_interval_seconds: float = 3.0  # how often global assigner runs
+    convergence_tolerance: float = 0.02   # 2% = "close enough" to target
+    max_slicers: int = 4                   # max concurrent time-slicing miners (0 = unlimited)
+    pool_failover_seconds: float = 90.0   # seconds of no-job before declaring pool unresponsive
+    force_reconnect_on_en2_mismatch: bool = False  # force reconnect when pools have different en2 sizes
+    sr_recruit_exclusions: list = None  # worker names excluded from SR dynamic slicer recruitment
+
+    def __post_init__(self):
+        if self.sr_recruit_exclusions is None:
+            self.sr_recruit_exclusions = []
+
+@dataclass
+class AppCfg:
+    listen_host: str
+    listen_port: int
+    metrics_enabled: bool
+    metrics_host: str
+    metrics_port: int
+    poolA: PoolCfg
+    poolB: PoolCfg
+    sched: SchedulerCfg
+    downstream_diff: dict
+
+# Load configuration from JSON file
+def load_config(path: str) -> AppCfg:
+    global LOG_LEVEL, LOG_ALLOW, LOG_DENY
+    with open(path, "rb") as f:
+        cfg = loads_json(f.read())
+
+    # Config-driven logging defaults (env vars still override if set)
+    logcfg = cfg.get("logging", {})
+    if isinstance(logcfg, dict):
+        if "DPMP_LOG_LEVEL" not in os.environ:
+            lvl = str(logcfg.get("level", "")).strip().lower()
+            if lvl:
+                LOG_LEVEL = lvl
+        if "DPMP_LOG_ALLOW" not in os.environ:
+            allow = logcfg.get("allow", None)
+            if isinstance(allow, str):
+                LOG_ALLOW = set(x.strip() for x in allow.split(",") if x.strip())
+            elif isinstance(allow, list):
+                LOG_ALLOW = set(str(x).strip() for x in allow if str(x).strip())
+        if "DPMP_LOG_DENY" not in os.environ:
+            deny = logcfg.get("deny", None)
+            if isinstance(deny, str):
+                LOG_DENY = set(x.strip() for x in deny.split(",") if x.strip())
+            elif isinstance(deny, list):
+                LOG_DENY = set(str(x).strip() for x in deny if str(x).strip())
+
+    listen = cfg.get("listen", {})
+    if not isinstance(listen, dict):
+        listen = {}
+    metrics = cfg.get("metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    # Backward/forward compatible config parsing:
+    # - Prefer nested listen/metrics dicts
+    # - Fall back to legacy top-level fields if present
+    listen_host = listen.get("host") or cfg.get("listen_host") or "0.0.0.0"
+    listen_port = listen.get("port") if listen.get("port") is not None else cfg.get("listen_port", 3350)
+    try:
+        listen_port = int(listen_port)
+    except Exception:
+        listen_port = 3350
+
+    if "enabled" in metrics:
+        metrics_enabled = bool(metrics.get("enabled"))
+    else:
+        metrics_enabled = bool(cfg.get("metrics_enabled", True))
+    metrics_host = metrics.get("host") or cfg.get("metrics_host") or "0.0.0.0"
+    metrics_port = metrics.get("port") if metrics.get("port") is not None else cfg.get("metrics_port", 9109)
+    try:
+        metrics_port = int(metrics_port)
+    except Exception:
+        metrics_port = 9109
+    pools = cfg.get("pools", {})
+    sched = cfg.get("scheduler", {})
+
+    def pool(key: str) -> PoolCfg:
+        p = pools.get(key, {})
+        return PoolCfg(
+            key=key,
+            name=str(p.get("name", key)),
+            host=str(p.get("host", "127.0.0.1")),
+            port=int(p.get("port", 3333)),
+            wallet=str(p.get("wallet", "")).strip(),
+            chain=str(p.get("chain", "")).strip().upper(),
+            idle_disconnect=bool(p.get("idle_disconnect", False)),
+        )
+
+    wA = int(sched.get("poolA_weight", 50))
+    wB = int(sched.get("poolB_weight", 50))
+    if wA < 0 or wB < 0 or (wA == 0 and wB == 0):
+        wA, wB = 50, 50
+
+    # Oracle auto-balance config
+    auto_balance = bool(sched.get("auto_balance", False))
+    auto_balance_max_deviation = int(sched.get("auto_balance_max_deviation", 20))
+    if auto_balance_max_deviation < 5 or auto_balance_max_deviation > 45:
+        safe_val = max(5, min(45, auto_balance_max_deviation))
+        log("config_safety_max_deviation_clamped",
+            raw=auto_balance_max_deviation, corrected=safe_val,
+            reason="auto_balance_max_deviation must be between 5 and 45")
+        auto_balance_max_deviation = safe_val
+
+    oracle_url = str(sched.get("oracle_url", "https://www.sr-analyst.com/dpmp/oracle.php")).strip()
+    oracle_poll_seconds = int(sched.get("oracle_poll_seconds", 600))
+    if oracle_poll_seconds < 600:
+        log("config_safety_oracle_poll_clamped",
+            raw=oracle_poll_seconds, corrected=600,
+            reason="oracle_poll_seconds must be >= 600 to stay within rate limits")
+        oracle_poll_seconds = 600
+    if auto_balance:
+        log("oracle_config", auto_balance=True,
+            max_deviation=auto_balance_max_deviation,
+            oracle_url=oracle_url,
+            poll_seconds=oracle_poll_seconds)
+
+    # --- Scheduler timing validation ---
+    # slice_seconds: minimum time a dynamic miner stays on one pool before
+    # switching.  This value also sets min_slice_seconds for the v3 scheduler.
+    # Recommended range: 10-30 seconds.  Lower values converge faster but may
+    # increase rejected shares on some miners.  Raise if reject % is too high.
+    raw_slice = int(sched.get("slice_seconds", 23))
+    SLICE_FLOOR = 10
+    SLICE_CEIL = 30
+    if raw_slice < SLICE_FLOOR:
+        log("config_safety_slice_clamped",
+            raw=raw_slice, corrected=SLICE_FLOOR,
+            reason=f"slice_seconds must be >= {SLICE_FLOOR}s")
+        raw_slice = SLICE_FLOOR
+    elif raw_slice > SLICE_CEIL:
+        log("config_safety_slice_clamped",
+            raw=raw_slice, corrected=SLICE_CEIL,
+            reason=f"slice_seconds must be <= {SLICE_CEIL}s")
+        raw_slice = SLICE_CEIL
+
+    log("scheduler_config_validated", slice_seconds=raw_slice, wA=wA, wB=wB)
+
+    # v3 scheduler config -- uses slice_seconds as min_slice_seconds
+    v3_min_slice = float(raw_slice)
+    v3_assigner_interval = float(sched.get("assigner_interval_seconds", 3.0))
+    v3_assigner_interval = max(1.0, min(10.0, v3_assigner_interval))
+    v3_convergence_tol = float(sched.get("convergence_tolerance", 0.02))
+    v3_convergence_tol = max(0.005, min(0.10, v3_convergence_tol))
+    # max_slicers: max number of miners that may time-slice simultaneously.
+    # 0 means unlimited (recruits as many as needed to converge).
+    # Default 4 is generous enough for any realistic fleet size.
+    v3_max_slicers = int(sched.get("max_slicers", 4))
+    if v3_max_slicers < 0:
+        v3_max_slicers = 0
+    # pool_failover_seconds: how long a pool must be job-silent before DPMP
+    # declares it unresponsive and moves all miners to the other pool.
+    # Default 90s: short enough to fail over during a pool crash (typically
+    # 2-4 minutes to recover), long enough to avoid false positives from
+    # brief network glitches.  Min 30s, max 600s.
+    v3_pool_failover_s = float(sched.get("pool_failover_seconds", 90.0))
+    v3_pool_failover_s = max(30.0, min(600.0, v3_pool_failover_s))
+    v3_force_reconnect_en2 = bool(sched.get("force_reconnect_on_en2_mismatch", False))
+    # sr_recruit_exclusions: list of worker names that should never be SR-recruited
+    # as dynamic time-slicers. These miners still switch pools normally as statics.
+    raw_exclusions = sched.get("sr_recruit_exclusions", [])
+    if isinstance(raw_exclusions, list):
+        v3_sr_exclusions = [str(x).strip() for x in raw_exclusions if str(x).strip()]
+    else:
+        v3_sr_exclusions = []
+
+    return AppCfg(
+        listen_host=str(listen_host),
+        listen_port=int(listen_port),
+        metrics_enabled=bool(metrics_enabled),
+        metrics_host=str(metrics_host),
+        metrics_port=int(metrics_port),
+        poolA=pool("A"),
+        poolB=pool("B"),
+        sched=SchedulerCfg(wA=wA, wB=wB, slice_seconds=raw_slice,
+                           auto_balance=auto_balance, auto_balance_max_deviation=auto_balance_max_deviation,
+                           oracle_url=oracle_url, oracle_poll_seconds=oracle_poll_seconds,
+                           min_slice_seconds=v3_min_slice,
+                           assigner_interval_seconds=v3_assigner_interval,
+                           convergence_tolerance=v3_convergence_tol,
+                           max_slicers=v3_max_slicers,
+                           pool_failover_seconds=v3_pool_failover_s,
+                           force_reconnect_on_en2_mismatch=v3_force_reconnect_en2,
+                           sr_recruit_exclusions=v3_sr_exclusions),
+        downstream_diff=dict(cfg.get("downstream_diff", {})),
+    )
+
+# Async read/write helpers with Prometheus metrics
+async def iter_lines(reader: asyncio.StreamReader, side: str):
+    while True:
+        line = await reader.readline()
+        if not line:
+            return
+        if not line.strip():
+            continue
+        MSG_RX.labels(side=side).inc()
+        yield line
+
+# 
+async def write_line(writer: asyncio.StreamWriter, data: bytes, side: str):
+    try:
+        # Downstream miners expect Stratum v1 notifications WITHOUT JSON-RPC 2.0 fields.
+        # Ensure we never send {'jsonrpc':'2.0', ...} or id:null on mining.notify.
+        if side == "downstream":
+            try:
+                msg = loads_json(data)
+                if isinstance(msg, dict) and msg.get("method") == "mining.notify":
+                    msg2 = sanitize_downstream_notification(msg)
+                    data = dumps_json(msg2)
+            except Exception:
+                pass
+        writer.write(data)
+        await writer.drain()
+        MSG_TX.labels(side=side).inc()
+
+        # Lightweight visibility into what we actually send.
+        # Log bytes + a small safe preview (helps confirm miner is receiving what we expect).
+        peer = writer.get_extra_info("peername")
+        preview = ""
+        try:
+            s = data.decode("utf-8", errors="replace").strip()
+            if len(s) > 1200:
+                preview = s[:1200] + "...(trunc)"
+            else:
+                preview = s
+        except Exception:
+            preview = "<decode_error>"
+
+        if side == "downstream":
+            log("downstream_tx", peer=str(peer), bytes=len(data), preview=preview)
+        else:
+            log("upstream_tx", peer=str(peer), side=side, bytes=len(data), preview=preview)
+
+    except Exception as e:
+        peer = writer.get_extra_info("peername")
+        log("write_failed", peer=str(peer), side=side, err=str(e))
+        raise
+
+# Extract jobid from mining.notify params
+def jobid_from_notify(msg: Dict[str, Any]) -> Optional[str]:
+    try:
+        p = msg.get("params") or []
+        return str(p[0]) if len(p) >= 1 else None
+    except Exception:
+        return None
+
+# Extract jobid from mining.submit params
+def jobid_from_submit(msg: Dict[str, Any]) -> Optional[str]:
+    try:
+        p = msg.get("params") or []
+        return str(p[1]) if len(p) >= 2 else None
+    except Exception:
+        return None
+
+# Simple weighted round-robin scheduler
+class RatioScheduler:
+    def __init__(self, wA: int, wB: int):
+        self.wA = max(0, int(wA))
+        self.wB = max(0, int(wB))
+        self.total = self.wA + self.wB
+        self.acc = 0
+
+    def pick(self) -> str:
+        if self.wA == 0 and self.wB > 0:
+            return "B"
+        if self.wB == 0 and self.wA > 0:
+            return "A"
+        self.acc += self.wA
+        if self.acc >= self.total:
+            self.acc -= self.total
+            return "A"
+        return "B"
+
+# Hashrate Oracle 
+# Async background task that polls the oracle endpoint and writes
+# weights_override.json based on real-time BTC/BCH hashrate measurements.
+# Only runs when auto_balance=true in config.
+
+import base64
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+
+async def oracle_poll_loop(cfg: AppCfg):
+    """
+    Background task that runs whenever chain config is valid (one BTC + one BCH pool).
+
+    Always collects data and updates Prometheus gauges regardless of mode.
+    Only writes weights_override.json when oracle_mode.json says oracle is active
+    (or when no oracle_mode.json exists and config auto_balance is true).
+
+    Every oracle_poll_seconds (default 600 = 10 min):
+      1. GET oracle endpoint -> JSON with BTC/BCH block timestamps + difficulty
+      2. Calculate hashrate for short window (6 blocks) and long window (72 blocks)
+      3. Compute weights using inverse-ratio model
+      4. Clamp to max_deviation (default 30/70)
+      5. If oracle mode is active: write weights_override.json
+
+    Safety rules:
+      - 60-second startup delay (avoids hammering if user restarts repeatedly)
+      - On error: hold current weights, try again next cycle
+      - After 3 consecutive failures: revert to 50/50 (only if oracle mode active)
+      - Stale data (>20 min old): treat as error
+    """
+    poll_s = max(60, int(cfg.sched.oracle_poll_seconds))
+    url = cfg.sched.oracle_url
+    max_dev = int(cfg.sched.auto_balance_max_deviation)
+    min_pct = 50 - max_dev   # e.g., 30
+    max_pct = 50 + max_dev   # e.g., 70
+
+    # Figure out which pool is BTC and which is BCH from config.
+    # The oracle needs this to apply the correct weights to the correct pool.
+    pool_chain = {}   # "A" -> "BTC" or "BCH"
+    pool_chain["A"] = getattr(cfg.poolA, "chain", "").upper()
+    pool_chain["B"] = getattr(cfg.poolB, "chain", "").upper()
+
+    if sorted([pool_chain["A"], pool_chain["B"]]) != ["BCH", "BTC"]:
+        log("oracle_disabled_bad_chain_config",
+            poolA_chain=pool_chain["A"], poolB_chain=pool_chain["B"],
+            reason="auto_balance requires one BTC pool and one BCH pool")
+        return  # exit task -- oracle cannot run without proper chain labels
+
+    btc_pool = "A" if pool_chain["A"] == "BTC" else "B"
+    bch_pool = "A" if pool_chain["A"] == "BCH" else "B"
+
+    log("oracle_starting",
+        url=url, poll_s=poll_s, max_deviation=max_dev,
+        btc_pool=btc_pool, bch_pool=bch_pool)
+
+    # Safety: wait 60 seconds before first poll
+    log("oracle_startup_delay", delay_s=60)
+    await asyncio.sleep(60)
+
+    consecutive_failures = 0
+
+    while True:
+        try:
+            # Step 1: Fetch data from oracle endpoint 
+            log("oracle_poll_start")
+
+            # Run the blocking HTTP call in a thread so we don't stall
+            # the asyncio event loop (which is running the proxy).
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, _oracle_fetch, url)
+
+            if data is None:
+                raise Exception("fetch returned None")
+
+            if not data.get("ok"):
+                raise Exception(f"oracle response not ok: {data.get('error', 'unknown')}")
+
+            # Step 2: Check data freshness 
+            # The "ts" field is the MySQL timestamp when the collector pushed data.
+            # If it's more than 20 minutes old, the collector might be down.
+            ts_str = data.get("ts", "")
+            age_s = None  # will be set if ts parsing succeeds
+            if ts_str:
+                try:
+                    # Parse MySQL datetime format: "2026-02-10 19:01:02"
+                    from datetime import datetime, timezone
+                    db_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    now_time = datetime.now(timezone.utc)
+                    age_s = (now_time - db_time).total_seconds()
+                    log("oracle_data_age", ts=ts_str, age_s=round(age_s, 1))
+                    if age_s > 1200:  # 20 minutes
+                        raise Exception(f"oracle data is stale ({int(age_s)}s old)")
+                except ValueError as e:
+                    log("oracle_ts_parse_warning", ts=ts_str, err=str(e))
+                    # Don't fail on parse error -- the data might still be fine
+
+            # Step 3: Calculate hashrates 
+            short_n = int(data.get("short_window", 6))
+            long_n = int(data.get("long_window", 72))
+
+            btc_hr_short, btc_hr_long = _calc_hashrate_pair(
+                data["btc_difficulty"], data["btc_ts_latest"],
+                data["btc_ts_short"], data["btc_ts_long"],
+                short_n, long_n, "BTC")
+
+            bch_hr_short, bch_hr_long = _calc_hashrate_pair(
+                data["bch_difficulty"], data["bch_ts_latest"],
+                data["bch_ts_short"], data["bch_ts_long"],
+                short_n, long_n, "BCH")
+
+            # Step 4: Compute weights (inverse ratio model) 
+            btc_ratio = btc_hr_short / btc_hr_long if btc_hr_long > 0 else 1.0
+            bch_ratio = bch_hr_short / bch_hr_long if bch_hr_long > 0 else 1.0
+
+            # Inverse: mine MORE where hashrate DROPPED (your shares worth more)
+            w_btc = 1.0 / btc_ratio if btc_ratio > 0 else 1.0
+            w_bch = 1.0 / bch_ratio if bch_ratio > 0 else 1.0
+
+            total_w = w_btc + w_bch
+            pct_btc = (w_btc / total_w) * 100.0 if total_w > 0 else 50.0
+            pct_bch = 100.0 - pct_btc
+
+            # Clamp to max deviation
+            pct_btc = max(min_pct, min(max_pct, pct_btc))
+            pct_bch = 100.0 - pct_btc
+
+            # Round to nearest integer for clean weights
+            wt_btc = round(pct_btc)
+            wt_bch = 100 - wt_btc
+
+            # Update Prometheus gauges
+            ORACLE_HASHRATE.labels(chain="BTC", window="short").set(btc_hr_short)
+            ORACLE_HASHRATE.labels(chain="BTC", window="long").set(btc_hr_long)
+            ORACLE_HASHRATE.labels(chain="BCH", window="short").set(bch_hr_short)
+            ORACLE_HASHRATE.labels(chain="BCH", window="long").set(bch_hr_long)
+            ORACLE_RATIO.labels(chain="BTC").set(round(btc_ratio, 4))
+            ORACLE_RATIO.labels(chain="BCH").set(round(bch_ratio, 4))
+            ORACLE_WEIGHT.labels(pool="A").set(wt_bch if bch_pool == "A" else wt_btc)
+            ORACLE_WEIGHT.labels(pool="B").set(wt_bch if bch_pool == "B" else wt_btc)
+            ORACLE_STATUS.set(1)
+            if age_s is not None:
+                ORACLE_AGE.set(round(age_s, 1))
+
+            log("oracle_calc_result",
+                btc_hr_short=f"{btc_hr_short:.3e}", btc_hr_long=f"{btc_hr_long:.3e}",
+                bch_hr_short=f"{bch_hr_short:.3e}", bch_hr_long=f"{bch_hr_long:.3e}",
+                btc_ratio=round(btc_ratio, 4), bch_ratio=round(bch_ratio, 4),
+                raw_btc_pct=round(pct_btc, 1), raw_bch_pct=round(pct_bch, 1),
+                clamped_btc=wt_btc, clamped_bch=wt_bch)
+
+            # Step 5: Map to pools and write override 
+            # btc_pool / bch_pool tell us which config pool is which chain.
+            wA = wt_btc if btc_pool == "A" else wt_bch
+            wB = wt_btc if btc_pool == "B" else wt_bch
+
+            log("oracle_weights_applied",
+                poolA_weight=wA, poolA_chain=pool_chain["A"],
+                poolB_weight=wB, poolB_chain=pool_chain["B"])
+
+            # Only write weights_override.json if oracle mode is active.
+            # When the user switches to slider mode via the GUI, oracle_mode.json
+            # is set to false and the slider controls weights_override.json instead.
+            # The oracle still runs (collecting data + updating Prometheus gauges)
+            # but does not interfere with the slider's weight file.
+            oracle_active = read_oracle_mode(cfg.sched.auto_balance)
+            if oracle_active and WEIGHTS_OVERRIDE_PATH is not None:
+                try:
+                    tmp = f"{WEIGHTS_OVERRIDE_PATH}.tmp"
+                    obj = {"poolA_weight": int(wA), "poolB_weight": int(wB),
+                           "source": "oracle", "ts": ts_str}
+                    with open(tmp, "w") as f:
+                        f.write(json.dumps(obj))
+                        f.write("\n")
+                    os.replace(tmp, WEIGHTS_OVERRIDE_PATH)
+                    log("oracle_override_written", path=WEIGHTS_OVERRIDE_PATH,
+                        wA=wA, wB=wB)
+                except Exception as e:
+                    log("oracle_override_write_error", err=str(e))
+            elif not oracle_active:
+                log("oracle_mode_slider", reason="oracle_mode.json says slider is active, skipping weight write")
+
+            consecutive_failures = 0
+
+        except asyncio.CancelledError:
+            log("oracle_cancelled")
+            raise
+        except Exception as e:
+            ORACLE_STATUS.set(0)
+            consecutive_failures += 1
+
+            log("oracle_poll_error", err=str(e),
+                consecutive_failures=consecutive_failures)
+
+            # After 3 consecutive failures, revert to 50/50
+            if consecutive_failures >= 3:
+                log("oracle_fallback_50_50",
+                    reason=f"{consecutive_failures} consecutive failures")
+                # Only write fallback weights if oracle is actually in control
+                oracle_active_fb = read_oracle_mode(cfg.sched.auto_balance)
+                if oracle_active_fb and WEIGHTS_OVERRIDE_PATH is not None:
+                    try:
+                        tmp = f"{WEIGHTS_OVERRIDE_PATH}.tmp"
+                        obj = {"poolA_weight": 50, "poolB_weight": 50,
+                               "source": "oracle_fallback"}
+                        with open(tmp, "w") as f:
+                            f.write(json.dumps(obj))
+                            f.write("\n")
+                        os.replace(tmp, WEIGHTS_OVERRIDE_PATH)
+                    except Exception:
+                        pass
+
+        # Wait for next poll cycle
+        log("oracle_next_poll", sleep_s=poll_s)
+        await asyncio.sleep(poll_s)
+
+
+def _oracle_fetch(url: str) -> dict:
+    """Blocking HTTP GET to the oracle endpoint. Called via run_in_executor."""
+    headers = {"User-Agent": "dpmpv2-oracle/1.0"}
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=15.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except HTTPError as e:
+        raise Exception(f"HTTP {e.code}: {e.reason}")
+    except URLError as e:
+        raise Exception(f"Connection error: {e.reason}")
+
+
+def _calc_hashrate_pair(difficulty: float, ts_latest: int,
+                         ts_short: int, ts_long: int,
+                         short_n: int, long_n: int,
+                         chain: str) -> tuple:
+    """
+    Calculate short-window and long-window hashrate for one chain.
+    
+    Formula: hashrate = difficulty 2^32 / average_block_time
+    
+    Returns (hashrate_short, hashrate_long) in H/s.
+    """
+    elapsed_short = ts_latest - ts_short
+    elapsed_long = ts_latest - ts_long
+
+    if elapsed_short <= 0 or elapsed_long <= 0:
+        log("oracle_bad_timestamps", chain=chain,
+            elapsed_short=elapsed_short, elapsed_long=elapsed_long)
+        return (0.0, 0.0)
+
+    avg_short = elapsed_short / short_n
+    avg_long = elapsed_long / long_n
+
+    hr_short = difficulty * (2**32) / avg_short
+    hr_long = difficulty * (2**32) / avg_long
+
+    return (hr_short, hr_long)
+
+# End Hashrate Oracle 
+
+
+def _is_extranonce_mismatch_reject(err) -> bool:
+    """Detect if a reject error indicates an extranonce1 mismatch.
+
+    When a miner submits shares with the wrong extranonce1 (e.g., Pool A's
+    extranonce1 sent to Pool B), the pool computes a completely different
+    hash, resulting in near-zero difficulty values (typically 1e-8 or less).
+    Normal vardiff rejects show difficulty values much closer to the target.
+
+    MiningCore format: {"code":23,"message":"low difficulty share (1.8e-10)","data":null}
+    ckpool format:     [23,"Difficulty too low",""]
+
+    Returns True if the error pattern strongly suggests extranonce1 mismatch.
+    """
+    try:
+        # MiningCore: extract difficulty from "low difficulty share (X)" message
+        msg_str = ""
+        if isinstance(err, dict):
+            msg_str = str(err.get("message", ""))
+        elif isinstance(err, list) and len(err) >= 2:
+            msg_str = str(err[1]) if err[1] else ""
+
+        if "low difficulty share" in msg_str.lower():
+            # Extract the numeric value from parentheses
+            _start = msg_str.find("(")
+            _end = msg_str.find(")")
+            if _start >= 0 and _end > _start:
+                _diff_val = float(msg_str[_start + 1:_end])
+                # Near-zero difficulty (< 0.001) = extranonce mismatch
+                # Normal vardiff rejects are orders of magnitude higher
+                if _diff_val < 0.001:
+                    return True
+    except (ValueError, TypeError, IndexError):
+        pass
+    return False
+
+
+async def _handle_switch_failure(session, peer_ip: str, pin_reason: str,
+                                 reason_detail: str) -> None:
+    """Handle a miner that failed to switch pools after set_extranonce.
+
+    Implements a two-stage escalation:
+      Stage 1: Force a clean reconnect so the miner gets the target pool's
+               extranonce via a fresh subscribe handshake.
+      Stage 2: If the miner already failed a reconnect-switch attempt for
+               this target pool, permanently pin it (last resort).
+
+    Args:
+        session:       The ProxySession instance.
+        peer_ip:       The miner's IP address string.
+        pin_reason:    Short tag like "extranonce1_mismatch" or "en2_size_mismatch".
+        reason_detail: Human-readable description for the log.
+    """
+    # Which pool were we trying to switch TO?
+    # active_pool is the pool currently failing (the one the miner just switched to).
+    # _target is that failing pool; _safe is the opposite (where the miner came from).
+    _target = session.active_pool
+    _safe = "A" if _target == "B" else "B"
+
+    if dpmp_fleet.reconnect_switch_should_pin(peer_ip, _target):
+        # Stage 2: already tried reconnect-switch, escalate to pin
+        dpmp_fleet.en2_force_pin(peer_ip)
+        log("en2_auto_pin_reject_storm", sid=session.sid,
+            miner_ip=peer_ip, worker=session.worker or "unknown",
+            rejects=session._post_switch_rejects,
+            accepts=session._post_switch_accepts,
+            en1_mismatch_count=session._post_switch_en1_mismatch,
+            en2a=session.extranonce2_size.get("A"),
+            en2b=session.extranonce2_size.get("B"),
+            pin_reason=pin_reason,
+            reason=reason_detail + " (reconnect already tried, pinning)")
+        # Reconnect to the safe pool (the pool opposite to the one that failed)
+        dpmp_fleet.en2_set_hint(peer_ip, _safe)
+        log("en2_force_reconnect", sid=session.sid,
+            to_pool=_safe, miner_ip=peer_ip,
+            reason="pin triggered, reconnecting to safe pool")
+        session.miner_w.close()
+    else:
+        # Stage 1: try a reconnect-switch to the target pool
+        dpmp_fleet.reconnect_switch_record_attempt(peer_ip, _target)
+        dpmp_fleet.en2_set_hint(peer_ip, _target)
+        log("en2_reconnect_switch", sid=session.sid,
+            miner_ip=peer_ip, worker=session.worker or "unknown",
+            target_pool=_target,
+            rejects=session._post_switch_rejects,
+            accepts=session._post_switch_accepts,
+            en1_mismatch_count=session._post_switch_en1_mismatch,
+            en2a=session.extranonce2_size.get("A"),
+            en2b=session.extranonce2_size.get("B"),
+            pin_reason=pin_reason,
+            reason=reason_detail + " (trying reconnect-switch first)")
+        session.miner_w.close()
+
+
+# Proxy session handling a single miner connection and two upstream pools
+class ProxySession:
+    def __init__(self, cfg: AppCfg, miner_r: asyncio.StreamReader, miner_w: asyncio.StreamWriter, sid: str):
+        self.cfg = cfg
+        self.sid = sid  # downstream session id (peer)
+        self.last_switch_mono: float | None = time.monotonic()
+        self.switch_count: int = 0
+        self.pool_w: Dict[str, asyncio.StreamWriter] = {}
+        self.up_q: Dict[str, list[tuple[str, str]]] = {"A": [], "B": []}  # (raw, tag) queued until writer exists
+        self.miner_r = miner_r
+        self.miner_w = miner_w
+
+        self.rA: Optional[asyncio.StreamReader] = None
+        self.wA: Optional[asyncio.StreamWriter] = None
+        self.rB: Optional[asyncio.StreamReader] = None
+        self.wB: Optional[asyncio.StreamWriter] = None
+
+        self.worker: str = ""
+        self.miner_ready = asyncio.Event()
+        self.authorize_id: Any = None
+        self.subscribe_id: Any = None
+        self.configure_id: Any = None
+        self.id_gen = itertools.count(1)
+
+        self.latest_notify_raw: Dict[str, Optional[bytes]] = {"A": None, "B": None}
+        self.latest_jobid: Dict[str, Optional[str]] = {"A": None, "B": None}
+        self.notify_seq: Dict[str, int] = {"A": 0, "B": 0}
+        self.last_notify_mono: Dict[str, float | None] = {"A": None, "B": None}
+        self.extranonce1: Dict[str, Optional[str]] = {"A": None, "B": None}
+        self.extranonce2_size: Dict[str, Optional[int]] = {"A": None, "B": None}
+
+        # Locked en2_size: set once from the FIRST subscribe response seen in
+        # this session, then never changed.  All downstream communication
+        # (subscribe rewrite, mining.set_extranonce) uses this value so the
+        # miner never sees an en2_size change mid-session.
+        self.locked_en2_size: Optional[int] = None
+
+        # Switch safety: suppress submits during the brief window between
+        # sending set_extranonce and the new pool's clean notify.
+        self.block_submits: bool = False
+
+        # Pending switch state: set to the target pool key when a switch is
+        # waiting for a cached job to arrive.  Suppresses the per-message
+        # switch_skipped_no_cached_job tight loop -- DPMP waits silently
+        # rather than retrying on every incoming miner message.
+        # Cleared when the switch completes or the target pool changes.
+        self._switch_pending_pool: str = ""
+
+        # Post-switch stale share grace window: monotonic timestamp until
+        # which all job-not-found/stale rejects are suppressed regardless
+        # of accept count.  Miner hardware pipelines can contain many
+        # in-flight shares built on the prior pool's work -- suppressing
+        # these for 30s after a switch prevents ckpool from banning the
+        # miner for a burst of unavoidable stale rejects.
+        self._switch_grace_end: float = 0.0
+
+        self.latest_diff: Dict[str, Optional[float]] = {"A": None, "B": None}
+        self.last_downstream_diff_by_pool: Dict[str, Optional[float]] = {"A": None, "B": None}
+        self.last_downstream_extranonce: Optional[tuple[str, int]] = None
+        self.downstream_setup_lock = asyncio.Lock()
+        self.last_downstream_en1: Optional[str] = None
+
+        self.last_downstream_en2s: Optional[int] = None
+
+        # Layer 2: Difficulty coalescing -- suppress rapid/minor diff changes
+        # from aggressive VarDiff pools like MiningCore.
+        self.last_diff_sent_mono: Dict[str, float] = {"A": 0.0, "B": 0.0}
+        self.diff_min_interval: float = 10.0      # seconds between diff updates
+        self.diff_pct_threshold: float = 0.15      # 15% change required to send
+
+        # Start active pool: spread miners across pools from the start.
+        # If one pool has zero weight, all miners go to the other.
+        # Otherwise, alternate miners between pools using a global counter
+        # so the fleet starts pre-balanced (e.g., 2 on A and 2 on B at 50/50).
+        if cfg.sched.wA <= 0 and cfg.sched.wB > 0:
+            self.active_pool: str = "B"
+        elif cfg.sched.wB <= 0 and cfg.sched.wA > 0:
+            self.active_pool: str = "A"
+        else:
+            # Both pools have weight -- alternate between A and B
+            self.active_pool: str = dpmp_fleet.next_pool_round_robin()
+
+        # Override active_pool if this miner was disconnected due to en2_size
+        # mismatch and should start on the target pool immediately.
+        # (Don't pop the hint here -- let the handshake selection consume it,
+        # but peek at it to set the initial active_pool.)
+        try:
+            _peer = miner_w.get_extra_info("peername")
+            if _peer:
+                _hint = dpmp_fleet.peek_en2_hint(_peer[0])
+                if _hint:
+                    self.active_pool = _hint
+                    log("active_pool_from_en2_hint", sid=self.sid,
+                        pool=self.active_pool, miner_ip=_peer[0])
+        except Exception:
+            pass
+
+        self.job_owner: Dict[tuple, str] = {}  # key=(pool_key, jobid)
+        # Layer 3: Old Job Grace Window -- keep expired jobs valid briefly
+        # so in-flight shares survive pool switches without rejection.
+        self.job_grace_seconds: float = 3.0
+        self.job_valid_until: Dict[tuple, float] = {}  # {(pool_key, jobid): mono_expiry}
+
+
+        # Cache parsed mining.notify params per job for share difficulty calculation.
+        # Key: (pool_key, jobid), Value: dict with version, prevhash, coinb1, coinb2,
+        # merkle_branches, nbits, ntime.  Limited to last 20 jobs to prevent leaks.
+        self.job_notify_cache: Dict[tuple, dict] = {}
+
+        self.last_forwarded_jobid: str | None = None
+
+        self.last_forwarded_pool: str | None = None
+
+        # Startup stale-share guard: drop all submits until the miner has
+        # received at least one mining.notify with clean_jobs=True in this
+        # session.  Miners buffer work internally and blast stale shares
+        # from a previous session immediately on reconnect.  These shares
+        # have old job IDs / wrong extranonce and will be rejected upstream.
+        self._session_ready: bool = False
+        self.submit_owner: Dict[Any, str] = {}
+        # per-pool (pool_key,id) de-dupe to prevent collisions between pools
+        self.seen_upstream_response_ids = set()
+        self.handshake_pool: str | None = None  # selected pool for subscribe/authorize handshake responses
+        # de-dupe upstream responses (subscribe/authorize collisions)
+        self.submit_diff: Dict[Any, float] = {}
+
+        self.submit_mono: Dict[Any, float] = {}  # submit timestamp for VarDiff suppression
+        self.submit_switch_mono: Dict[Any, float] = {}  # last_switch_mono at submit time
+        self.submit_true_diff: Dict[Any, float] = {}  # true share difficulty from header hash
+
+        self.accepted_diff_sum: Dict[str, float] = {"A": 0.0, "B": 0.0}
+        # Deduplicate submits to avoid upstream "Duplicate share" when miners retry submits.
+        # key: pool -> {fingerprint: last_seen_monotonic}
+        self.submit_fp_last: Dict[str, Dict[tuple, float]] = {"A": {}, "B": {}}
+        self.submit_fp_max: int = 512
+        self.submit_fp_ttl_s: float = 45.0
+
+        self.sched = RatioScheduler(cfg.sched.wA, cfg.sched.wB)
+        # Internal upstream bootstrap (subscribe/auth) so both pools produce notify,
+        # even if the miner never sends subscribe/authorize.
+        self._internal_next_id: int = 9000000
+        self._internal_ids: set[int] = set()
+        self._internal_subscribe_id: Dict[str, int] = {}   # pool_key -> id
+        self._internal_authorize_id: Dict[str, int] = {}   # pool_key -> id
+
+        # Failover state 
+        # pool_alive: True when pool TCP connection is healthy and reading.
+        #             Set to False when pool_reader detects EOF or error.
+        #             Set back to True when reconnect succeeds.
+        self.pool_alive: Dict[str, bool] = {"A": True, "B": True}
+        
+        self.pool_idle_disconnected: Dict[str, bool] = {"A": False, "B": False}
+        # pool_reconnect_mono: monotonic time of last reconnect attempt per pool.
+        # Used to detect the race condition where reconnect completed but
+        # mining.notify hasn't arrived yet -- re-arms reconnect after 10s.
+        self._pool_reconnect_mono: Dict[str, float] = {"A": 0.0, "B": 0.0}
+
+        # pool_fail_count: consecutive reconnect failures (drives exponential backoff).
+        #                  Reset to 0 on successful reconnect.
+        self.pool_fail_count: Dict[str, int] = {"A": 0, "B": 0}
+
+        # pool_last_fail_mono: monotonic timestamp of the most recent failure.
+        #                      Used to calculate "how long has this pool been down?"
+        self.pool_last_fail_mono: Dict[str, Optional[float]] = {"A": None, "B": None}
+
+        # pool_reconnect_task: handle to the background asyncio task that is
+        #                      currently trying to reconnect this pool (or None).
+        #                      Prevents launching duplicate reconnect attempts.
+        self.pool_reconnect_task: Dict[str, Optional[asyncio.Task]] = {"A": None, "B": None}
+
+        # original_weights: snapshot of the configured weights from config_v2.json.
+        #                   When a pool goes down, the scheduler temporarily acts as
+        #                   if the dead pool has weight 0. When the pool recovers,
+        #                   we restore these original values.
+        self.original_weights: tuple[int, int] = (cfg.sched.wA, cfg.sched.wB)
+        # End failover state 
+
+        # --- Health scoring per-session state (Phase 1b) ---
+        # Tracks post-switch behavior to detect reject storms, clean switches,
+        # and disconnect-after-switch events.  These feed into the global
+        # _fleet_health scores keyed by worker name.
+        #
+        # _health_post_switch_rejects: count of rejects within 4s of last switch
+        #   If this exceeds 5, a "reject_storm" health event fires (-0.05).
+        # _health_post_switch_storm_fired: True if we already fired the storm
+        #   event for the current switch (prevents double-counting).
+        # _health_clean_switch_pending: monotonic timestamp when a switch happened.
+        #   After 10 seconds with no rejects, a "clean_switch" event fires (+0.01).
+        #   Reset to None once the event fires or a reject cancels it.
+        # _health_last_continuous_credit: monotonic timestamp of last continuous
+        #   mining credit.  Every 60 seconds without issues, a small positive
+        #   event fires (+0.005 per minute = event_score ~1.0 with tiny alpha).
+        self._health_post_switch_rejects: int = 0
+        self._health_post_switch_storm_fired: bool = False
+        self._health_clean_switch_pending: float | None = None
+        self._health_last_continuous_credit: float = time.monotonic()
+
+        self._post_switch_accepts: int = 0
+        self._post_switch_rejects: int = 0
+        self._post_switch_en1_mismatch: int = 0  # count of near-zero diff rejects (extranonce1 mismatch)
+        self._slice_timer_started: bool = False   # True once first accepted share received on current pool
+
+        # Grace period after a pool switch: do not count rejects toward
+        # the auto-pin threshold for this many seconds.  Miners need time
+        # to flush old work and start producing shares on the new pool.
+        # Miners that CAN switch (AvalonQ, BM101) will produce accepts
+        # within this window, clearing the mismatch counter.  Miners that
+        # CANNOT switch (Gekko) will still hit the threshold after the
+        # grace period expires because they never produce accepts.
+        self._pin_grace_period_s: float = 5.0
+
+        # Post-switch stale-share grace period (seconds).  After a pool
+        # switch, suppress all stale/job-not-found rejects for this long
+        # regardless of accept count.  Hardware pipelines can hold many
+        # in-flight shares from the old pool -- we don't want ckpool to
+        # ban the miner for this unavoidable burst.
+        self._SWITCH_GRACE_S: float = 30.0
+
+        # VarDiff ramp suppression: track consecutive null-error rejects per pool.
+        # When a pool raises its required diff before sending mining.set_difficulty,
+        # shares at the old diff get rejected. We detect this pattern and swallow
+        # the rejects, sending fake accepts to the miner.
+        self._vardiff_ramp_consec_rejects: int = 0
+        self._vardiff_ramp_suppressed: int = 0
+        self._vardiff_ramp_pool: Optional[str] = None
+
+    # Send JSON stratum message upstream to pool A or B
+    async def send_upstream(self, pool_key: str, msg: dict) -> None:
+        """Send a JSON stratum message upstream to pool A or B."""
+        raw = dumps_json(msg)
+        w = self.pool_w.get(pool_key)
+        if w is None:
+            # pool writer not ready yet -> queue the raw line and flush when pool connects
+            q = self.up_q.setdefault(pool_key, [])
+            q.append((raw, pool_key))
+            log("send_upstream_queued", sid=self.sid, pool=pool_key, qlen=len(q))
+            return
+        await write_line(w, raw, f"upstream{pool_key}")
+
+    # Get next internal id for subscribe/authorize bootstrap
+    def next_internal_id(self) -> int:
+        self._internal_next_id += 1
+        return self._internal_next_id
+
+    # Bootstrap pool connection with subscribe/authorize
+    async def bootstrap_pool(self, pcfg: PoolCfg, is_reconnect: bool = False) -> None:
+        """Internal subscribe/auth to ensure pool emits notify and we can cache jobs.
+        
+        Only bootstrap the NON-handshake pool at initial startup. The handshake
+        pool gets its subscribe/authorize from the miner directly during the
+        initial handshake.
+        
+        On RECONNECT (is_reconnect=True), always bootstrap -- the miner won't
+        re-send subscribe/authorize, so we must do it ourselves.
+        """
+        if not is_reconnect:
+            # Check for en2_size reconnect hint first
+            handshake = None
+            try:
+                _peer = self.miner_w.get_extra_info("peername")
+                if _peer:
+                    _hint = dpmp_fleet.peek_en2_hint(_peer[0])
+                    if _hint:
+                        handshake = _hint
+                        log("bootstrap_handshake_from_en2_hint", sid=self.sid,
+                            pool=handshake, miner_ip=_peer[0])
+            except Exception:
+                pass
+
+            if handshake is None:
+                # Determine which pool will be the handshake pool (weight-based).
+                try:
+                    wA = float(getattr(self.cfg.sched, "wA", 0))
+                    wB = float(getattr(self.cfg.sched, "wB", 0))
+                except Exception:
+                    wA, wB = 1.0, 0.0
+                
+                if wA <= 0 and wB > 0:
+                    handshake = "B"
+                elif wB <= 0 and wA > 0:
+                    handshake = "A"
+                elif wB > wA:
+                    handshake = "B"
+                else:
+                    handshake = "A"
+            
+            # Only bootstrap the NON-handshake pool at initial startup
+            if pcfg.key == handshake:
+                log("bootstrap_skipped_handshake_pool", sid=self.sid, pool=pcfg.key, handshake=handshake)
+                return
+        else:
+            log("bootstrap_reconnect_forced", sid=self.sid, pool=pcfg.key,
+                reason="reconnect always bootstraps")
+
+        try:
+            sid_sub = self.next_internal_id()
+            self._internal_ids.add(sid_sub)
+            self._internal_subscribe_id[pcfg.key] = sid_sub
+            sub = {"id": sid_sub, "method": "mining.subscribe", "params": ["dpmpv2/1.0"]}
+            await self.send_upstream(pcfg.key, sub)
+            log("pool_bootstrap_subscribe_sent", sid=self.sid, pool=pcfg.key, id=sid_sub)
+
+            # remove the initial bootstrap as it does not play well with ckpool (Bassin), we
+            # were getting "Worker Mismatch" from Bassin.
+            # so instead of bootstrap then subscribe, we just subscribe which seems to be enough 
+            #aid = self.next_internal_id()
+            #self._internal_ids.add(aid)
+            #self._internal_authorize_id[pcfg.key] = aid
+            #user = f"{pcfg.wallet}.dpmp_bootstrap" if pcfg.wallet else "dpmp_bootstrap"
+            #auth = {"id": aid, "method": "mining.authorize", "params": [user, "x"]}
+            #await self.send_upstream(pcfg.key, auth)
+            #log("pool_bootstrap_authorize_sent", sid=self.sid, pool=pcfg.key, id=aid, user=user)
+        except Exception as e:
+            log("pool_bootstrap_error", sid=self.sid, pool=pcfg.key, err=str(e))
+
+    # Connect to upstream pool    
+    async def connect_pool(self, pcfg: PoolCfg, is_reconnect: bool = False) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        log("pool_connecting", key=pcfg.key, pool=pcfg.name, host=pcfg.host, port=pcfg.port)
+        r, w = await asyncio.open_connection(pcfg.host, pcfg.port)
+        CONN_UPSTREAM.labels(pool=pcfg.key).inc()
+        log("pool_connected", key=pcfg.key, pool=pcfg.name, host=pcfg.host, port=pcfg.port)
+
+        # register writer immediately + flush any queued upstream messages for this pool
+        self.pool_w[pcfg.key] = w
+        q = self.up_q.get(pcfg.key) or []
+        if q:
+            to_flush = [raw for (raw, tag) in q if tag == pcfg.key]
+            keep = [(raw, tag) for (raw, tag) in q if tag != pcfg.key]
+            if to_flush:
+                log("send_upstream_flush_start", sid=self.sid, pool=pcfg.key, qlen=len(to_flush))
+                for raw in to_flush:
+                    await write_line(w, raw, f"upstream{pcfg.key}")
+                log("send_upstream_flush_done", sid=self.sid, pool=pcfg.key)
+            self.up_q[pcfg.key] = keep
+        
+        await self.bootstrap_pool(pcfg, is_reconnect=is_reconnect)
+        return r, w
+
+    # Rewrite authorize message to use configured wallet and extracted worker name
+    def rewrite_authorize(self, pcfg: PoolCfg, msg: Dict[str, Any]) -> Dict[str, Any]:
+        params = msg.get("params") or []
+        miner_user = str(params[0]) if len(params) >= 1 else ""
+
+        # Only learn/overwrite worker name when miner_user is non-empty.
+        # This prevents autoauthorize (which may start with empty/unknown user) from clobbering
+        # an already-known worker name.
+        if miner_user.strip():
+            self.worker = extract_worker_name(miner_user)
+
+        pw = str(params[1]) if len(params) >= 2 else "x"
+        worker = (self.worker or "worker").strip() or "worker"
+        user = f"{pcfg.wallet}.{worker}" if pcfg.wallet else worker
+        out = dict(msg)
+        out["params"] = [user, pw]
+        return out
+
+    # Downstream difficulty policy
+    def downstream_diff_policy(self, pool_key: str) -> Optional[float]:
+        d = self.latest_diff.get(pool_key)
+
+        # Config-driven clamp to keep pools from forcing unusably-low (or high) downstream difficulty.
+        # Example config:
+        # "downstream_diff": {"default_min": 1, "poolA_min": 8192, "poolB_min": 1, "poolA_max": null, "poolB_max": null}
+        dd = getattr(self.cfg, "downstream_diff", None)
+        if isinstance(dd, dict):
+            default_min = dd.get("default_min")
+            pool_min = dd.get(f"pool{pool_key}_min", default_min)
+            pool_max = dd.get(f"pool{pool_key}_max")
+        else:
+            pool_min = None
+            pool_max = None
+
+        # If pool hasn't sent a difficulty yet, don't send anything.
+        # The pool will send its VarDiff shortly in the notify stream.
+        # Sending pool_min as a placeholder causes miners with slow
+        # firmware (e.g. Gekko) to build a pipeline of work at the
+        # wrong difficulty, producing a burst of rejects when the
+        # pool's actual VarDiff arrives.
+        if d is None:
+            return None
+
+        try:
+            v = float(d)
+        except Exception:
+            return None
+
+        if pool_min is not None:
+            try:
+                vmin = float(pool_min)
+                if v < vmin:
+                    v = vmin
+            except Exception:
+                pass
+
+        if pool_max is not None:
+            try:
+                vmax = float(pool_max)
+                if v > vmax:
+                    v = vmax
+            except Exception:
+                pass
+
+        # Miner-compat: force integer difficulty downstream (avoid fractional VarDiff diffs).
+        # IMPORTANT: return an int so JSON params are [756] not [756.0] (some miners ignore float diffs).
+
+        try:
+            v = int(float(v) + 0.999999)  # ceil without math import
+        except Exception:
+            pass
+
+        return v
+
+    # Send extranonce1 and extranonce2_size downstream if changed
+    async def maybe_send_downstream_extranonce(self, pool_key: str):
+        # If we already raw-forwarded the pool's subscribe result,
+        # do NOT re-send extranonce (pool-agnostic safety).
+        # The miner already received the extranonce inside the subscribe response.
+        # Sending mining.set_extranonce to miners that don't support it
+        # (NerdAxe, NerdMiner, etc.) causes disconnect/reboot loops.
+        if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+            # Only safe to skip if no OTHER pool's extranonce has been sent yet.
+            # Once we send mining.set_extranonce for Pool B, the miner loses
+            # Pool A's subscribe extranonce.  Switching back to A requires an
+            # explicit send even though A was the raw-subscribe pool.
+            last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
+            if last_en_pool is not None and last_en_pool != pool_key:
+                # Miner currently has a DIFFERENT pool's extranonce -- must send.
+                # Fall through to the normal send path below.
+                pass
+            else:
+                # Miner still has the subscribe extranonce -- safe to skip.
+                en1 = self.extranonce1.get(pool_key)
+                en2s = self.extranonce2_size.get(pool_key)
+                if en1 is not None and en2s is not None:
+                    self.last_downstream_en1 = str(en1)
+                    self.last_downstream_en2s = int(en2s)
+                    self.last_downstream_extranonce_pool = pool_key
+                log("downstream_extranonce_skip_raw_subscribe", pool=pool_key,
+                    raw_subscribe_forwarded_pool=getattr(self, "raw_subscribe_forwarded_pool", None),
+                    last_downstream_extranonce_pool=getattr(self, "last_downstream_extranonce_pool", None))
+                return
+        en1 = self.extranonce1.get(pool_key)
+        en2s = self.extranonce2_size.get(pool_key)
+        if not en1 or en2s is None:
+            log("downstream_extranonce_skip_no_data", sid=self.sid, pool=pool_key,
+                en1=en1, en2s=en2s)
+            return
+
+        async with self.downstream_setup_lock:
+            new_en1 = str(en1)
+            # Always use the session-locked en2_size so the miner never sees
+            # a different value mid-session.  Fall back to pool's actual en2s
+            # only if locked_en2_size is not yet set (shouldn't happen).
+            new_en2s = self.locked_en2_size if self.locked_en2_size is not None else int(en2s)
+            
+            # Force send if the miner's current extranonce context is for a
+            # DIFFERENT pool than the one we're switching to.  This is the only
+            # time we truly need to send mining.set_extranonce.
+            # When the same non-handshake pool sends a new notify with the same
+            # extranonce, we skip (no redundant sends that would crash NerdAxe).
+            handshake = getattr(self, "handshake_pool", None)
+            last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
+            force_send = (last_en_pool is not None and last_en_pool != pool_key)
+
+            # Debug logging to see why force_send might be False
+            log("downstream_extranonce_check", sid=self.sid, pool=pool_key,
+                handshake=handshake, last_en_pool=last_en_pool, force_send=force_send,
+                new_en1=new_en1, new_en2s=new_en2s,
+                locked_en2_size=self.locked_en2_size,
+                upstream_en2s=int(en2s),
+                last_en1=self.last_downstream_en1, last_en2s=self.last_downstream_en2s)
+            
+            # Only skip if NOT force_send AND values unchanged
+            if not force_send and self.last_downstream_en1 == new_en1 and self.last_downstream_en2s == new_en2s:
+                log("downstream_extranonce_skip_nochange", sid=self.sid, pool=pool_key,
+                    en1=new_en1, en2s=new_en2s,
+                    last_en1=str(self.last_downstream_en1), last_en2s=str(self.last_downstream_en2s),
+                    force_send=force_send, handshake=handshake, last_en_pool=last_en_pool)
+                return
+
+            # Send the extranonce (en2_size is always the locked session value)
+            msg = {"method": "mining.set_extranonce", "params": [new_en1, new_en2s]}
+            try:
+                await write_line(self.miner_w, dumps_json(msg), "downstream")
+            except Exception as e:
+                log("downstream_extranonce_send_error", sid=self.sid, pool=pool_key, err=str(e),
+                    extranonce1=new_en1, extranonce2_size=new_en2s)
+                raise
+
+            self.last_downstream_en1 = new_en1
+            self.last_downstream_en2s = new_en2s
+            self.last_downstream_extranonce_pool = pool_key
+            log("downstream_extranonce_set", sid=self.sid, pool=pool_key,
+                extranonce1=new_en1, extranonce2_size=new_en2s,
+                locked_en2_size=self.locked_en2_size,
+                force_send=force_send, handshake=handshake)
+
+
+    def _commit_job(self, pool_key: str, jid: str):
+        """Register a job in job_owner and set its grace window expiry."""
+        self.job_owner[(pool_key, jid)] = pool_key
+        self.job_valid_until[(pool_key, jid)] = time.monotonic() + self.job_grace_seconds
+
+
+    # Send downstream difficulty if changed
+    async def maybe_send_downstream_diff(self, pool_key: str, force: bool = False) -> bool:
+        # If a pool is disabled by scheduler weights, never send its difficulty downstream.
+        # Prevents diff flips from the non-active pool (poisoning).
+        if pool_key == "A" and self.cfg.sched.wA <= 0:
+            return False
+        if pool_key == "B" and self.cfg.sched.wB <= 0:
+            return False
+        async with self.downstream_setup_lock:
+            dd = self.downstream_diff_policy(pool_key)
+            if dd is None:
+                return False
+            last_dd = self.last_downstream_diff_by_pool.get(pool_key)
+            # Exact match -- nothing to do
+            if (not force) and last_dd is not None and dd == last_dd:
+                return False
+
+            dd_sent = int(dd) if dd is not None else dd
+            now = time.monotonic()
+            last_mono = self.last_diff_sent_mono.get(pool_key, 0.0)
+
+            # Layer 2: Difficulty coalescing (skip for forced sends like pool switches)
+            # IMPORTANT: Never suppress a difficulty INCREASE -- the miner must be
+            # told or it will produce shares below the pool's target, which get
+            # rejected as "Above target".  Only suppress decreases or minor
+            # fluctuations where the miner's current diff already meets the target.
+            if not force and last_dd is not None and last_dd > 0:
+                is_increase = (dd_sent > last_dd)
+                if is_increase:
+                    # Always forward difficulty increases immediately
+                    pass
+                else:
+                    # Difficulty decrease or no change -- safe to suppress
+                    # Time dampening: suppress if too soon since last diff change
+                    if now - last_mono < self.diff_min_interval:
+                        log("diff_coalesce_suppressed_time", sid=self.sid, pool=pool_key,
+                            dd=dd_sent, last_dd=last_dd,
+                            elapsed=round(now - last_mono, 1),
+                            min_interval=self.diff_min_interval)
+                        return False
+                    # Percent dampening: suppress if change is too small
+                    pct_change = abs(dd_sent - last_dd) / max(last_dd, 1)
+                    if pct_change < self.diff_pct_threshold:
+                        log("diff_coalesce_suppressed_pct", sid=self.sid, pool=pool_key,
+                            dd=dd_sent, last_dd=last_dd,
+                            pct_change=round(pct_change * 100, 1),
+                            threshold=self.diff_pct_threshold * 100)
+                        return False
+
+            self.last_downstream_diff_by_pool[pool_key] = dd_sent
+            self.last_diff_sent_mono[pool_key] = now
+            DIFF_DOWNSTREAM.set(dd_sent)
+            log("downstream_send_diff", sid=self.sid, pool=pool_key,
+                payload={"method": "mining.set_difficulty", "params": [dd_sent]})
+            await write_line(self.miner_w, dumps_json({"method": "mining.set_difficulty", "params": [dd_sent]}), "downstream")
+            log("downstream_diff_set", sid=self.sid, pool=pool_key,
+                diff=dd, diff_sent=dd_sent, pct_from_last=round(
+                    abs(dd_sent - (last_dd or 0)) / max(last_dd or 1, 1) * 100, 1))
+            return True
+
+    # Resend latest notify as clean (isCleanJob=true)
+    async def resend_active_notify_clean(self, pool_key: str, reason: str):
+        """After diff/extranonce changes, immediately resend latest job as clean notify.
+        Reduces mismatch windows that cause bursts of 'low difficulty share' rejects.
+        """
+        raw = self.latest_notify_raw.get(pool_key)
+        jid = self.latest_jobid.get(pool_key)
+        if raw is None:
+            log("resend_notify_skipped_no_cached", sid=self.sid, pool=pool_key, reason=reason)
+            return
+        try:
+            nm = loads_json(raw)
+            if nm.get("method") == "mining.notify":
+
+                params = nm.get("params") or []
+                if len(params) >= 1:
+                    # Step 1: preserve upstream clean_jobs flag instead of forcing True.
+                    # Only pad to 9 params if needed (some pools send fewer),
+                    # but do NOT override the clean flag -- let the pool decide.
+                    if len(params) < 9:
+                        while len(params) < 9:
+                            params.append(False)
+                    # params[-1] is left as-is (whatever upstream sent)
+                    nm["params"] = params
+                nm2 = sanitize_downstream_notification(nm)
+                log("downstream_send_notify", payload=nm2,
+                    clean_jobs=bool(params[-1]) if len(params) >= 9 else None)
+
+                # Safe switch sequence:
+                # 1) Block submits so stale shares during the switch are swallowed
+                # 2) Send set_extranonce (with locked en2_size)
+                # 3) Brief delay to let the miner process the new extranonce
+                # 4) Send difficulty
+                # 5) Send clean notify from new pool
+                # 6) Unblock submits
+                self.block_submits = True
+                try:
+                    # This is how we were switching pools originally but it sounds like
+                    # it might be too aggressive for some miners that don't handle rapid 
+                    # extranonce/diff changes well (e.g. Gekko).
+
+                    #await self.maybe_send_downstream_extranonce(pool_key)
+                    #await asyncio.sleep(0.05)  # 50ms for miner to absorb extranonce
+                    #await self.maybe_send_downstream_diff(pool_key, force=True)
+                    #await write_line(self.miner_w, dumps_json(nm2), "downstream")
+
+                    # 1) Flush: send the NEW pool's notify with clean_jobs=True
+                    #    This tells the miner to drop all old work
+                    await write_line(self.miner_w, dumps_json(nm2), "downstream")
+                    await asyncio.sleep(0.1)
+
+                    # 2) Send new extranonce (with locked en2_size)
+                    await self.maybe_send_downstream_extranonce(pool_key)
+                    await asyncio.sleep(0.1)
+
+                    # 3) Reassert difficulty
+                    await self.maybe_send_downstream_diff(pool_key, force=True)
+                    await asyncio.sleep(0.1)
+
+                    # 4) Send the real notify again with clean_jobs=True
+                    #    Now the miner has correct extranonce + diff + fresh job
+                    await write_line(self.miner_w, dumps_json(nm2), "downstream")
+
+                finally:
+                    self.block_submits = False
+                # Commit forwarded-job state for submit routing (resend path must mirror scheduler forward path)
+                self.last_forwarded_pool = pool_key
+                self.last_forwarded_jobid = jid
+                if not self._session_ready:
+                    self._session_ready = True
+                    log("session_ready", sid=self.sid, pool=pool_key, jobid=jid)
+                if jid:
+                    self._commit_job(pool_key, jid)
+                self.last_notify_mono[pool_key] = time.monotonic()
+                log("resend_notify_clean", sid=self.sid, pool=pool_key, jobid=jid, reason=reason)
+                return
+        except Exception as e:
+            log("resend_notify_error", sid=self.sid, pool=pool_key, jobid=jid, reason=reason, err=str(e))
+        log("downstream_send_raw", payload=raw.decode("utf-8", errors="replace"))
+        await write_line(self.miner_w, raw, "downstream")
+        log("resend_notify_raw", sid=self.sid, pool=pool_key, jobid=jid, reason=reason)
+
+    # Forward miner messages to upstream pools
+    async def miner_to_pools(self):
+        # At 100/0 or 0/100, only one pool writer exists. That's OK.
+        assert self.wA or self.wB, "No upstream pool connections available"
+
+        async for raw in iter_lines(self.miner_r, "downstream"):
+            try:
+                msg = loads_json(raw)
+            except Exception as e:
+                log("miner_bad_json", err=str(e))
+                continue
+
+            m = msg.get("method")
+            if m:
+                log("miner_method", sid=self.sid, method=m)
+            if m == "mining.configure":
+                # Forward mining.configure to the handshake pool so its response goes back to the miner,
+                # BUT also send a copy to the other pool using an internal id so we can consume the reply
+                # without forwarding it downstream. This prevents Pool B "low difficulty share" rejects
+                # when the miner is version-rolling.
+                try:
+                    cfg_id = msg.get("id")
+                    if self.handshake_pool is None:
+                        # Check for en2_size reconnect hint (miner disconnected
+                        # after en2_size change and should handshake on target pool).
+                        try:
+                            peer = self.miner_w.get_extra_info("peername")
+                            if peer:
+                                hint = dpmp_fleet.pop_en2_hint(peer[0])
+                                if hint:
+                                    self.handshake_pool = hint
+                                    log("handshake_pool_from_en2_hint", sid=self.sid,
+                                        pool=hint, miner_ip=peer[0])
+                        except Exception:
+                            pass
+
+                    if self.handshake_pool is None:
+                        # Choose handshake pool intelligently:
+                        # 1. If only one pool has weight, use that one.
+                        # 2. If both pools are active and have different en2_sizes,
+                        #    prefer the larger en2_size. Miners handle truncation
+                        #    (large->small) better than extension (small->large).
+                        # 3. Otherwise fall back to the higher-weight pool.
+                        try:
+                            wA = float(getattr(self.cfg.sched, "wA", 0))
+                            wB = float(getattr(self.cfg.sched, "wB", 0))
+                        except Exception:
+                            wA, wB = 1.0, 0.0
+                        if wA <= 0 and wB > 0:
+                            self.handshake_pool = "B"
+                        elif wB <= 0 and wA > 0:
+                            self.handshake_pool = "A"
+                        else:
+                            # Both pools active -- check en2_sizes.
+                            # Prefer the SMALLER en2_size for handshake so that
+                            # pool switches are always extension (small->large).
+                            # Real-world testing shows miners handle extension
+                            # (4->8 bytes) much better than truncation (8->4).
+                            _en2a = self.extranonce2_size.get("A")
+                            _en2b = self.extranonce2_size.get("B")
+                            if _en2a is not None and _en2b is not None and _en2a != _en2b:
+                                if _en2a < _en2b:
+                                    self.handshake_pool = "A"
+                                    log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                        pool="A", en2a=_en2a, en2b=_en2b)
+                                else:
+                                    self.handshake_pool = "B"
+                                    log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                        pool="B", en2a=_en2a, en2b=_en2b)
+                            elif wB > wA:
+                                self.handshake_pool = "B"
+                            else:
+                                self.handshake_pool = "A"
+
+                    hp = self.handshake_pool
+                    other = "B" if hp == "A" else "A"
+
+                    # 1) forward original to handshake pool (reply goes to miner)
+                    await self.send_upstream(hp, msg)
+
+                    # 2) forward copy to other pool (reply is internal-only)
+                    # Skip if the other pool has zero weight (not connected).
+                    other_w = getattr(self.cfg.sched, "wB" if other == "B" else "wA", 0)
+                    if other_w > 0:
+                        iid = self.next_internal_id()
+                        self._internal_ids.add(iid)
+                        msg2 = dict(msg)
+                        msg2["id"] = iid
+                        await self.send_upstream(other, msg2)
+                        log("configure_forwarded_both_pools", sid=self.sid, handshake=hp, other=other, id=cfg_id, internal_id=iid)
+                    else:
+                        log("configure_skip_zero_weight_pool", sid=self.sid, pool=other)
+
+                except Exception as e:
+                    log("configure_forward_both_error", sid=self.sid, err=str(e))
+                continue
+
+            if m == "mining.subscribe":
+                self.subscribe_id = msg.get("id")
+                if self.handshake_pool is None:
+                    # Check for en2_size reconnect hint
+                    try:
+                        peer = self.miner_w.get_extra_info("peername")
+                        if peer:
+                            hint = dpmp_fleet.pop_en2_hint(peer[0])
+                            if hint:
+                                self.handshake_pool = hint
+                                log("handshake_pool_from_en2_hint", sid=self.sid,
+                                    pool=hint, miner_ip=peer[0])
+                    except Exception:
+                        pass
+
+                if self.handshake_pool is None:
+                    # Choose handshake pool intelligently:
+                    # Prefer the pool with the larger en2_size (miners handle
+                    # truncation better than extension), else fall back to weights.
+                    try:
+                        wA = float(getattr(self.cfg.sched, "wA", 0))
+                        wB = float(getattr(self.cfg.sched, "wB", 0))
+                    except Exception:
+                        wA, wB = 1.0, 0.0
+                    if wA <= 0 and wB > 0:
+                        self.handshake_pool = "B"
+                    elif wB <= 0 and wA > 0:
+                        self.handshake_pool = "A"
+                    else:
+                        _en2a = self.extranonce2_size.get("A")
+                        _en2b = self.extranonce2_size.get("B")
+                        if _en2a is not None and _en2b is not None and _en2a != _en2b:
+                            if _en2a < _en2b:
+                                self.handshake_pool = "A"
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                    pool="A", en2a=_en2a, en2b=_en2b)
+                            else:
+                                self.handshake_pool = "B"
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                    pool="B", en2a=_en2a, en2b=_en2b)
+                        elif wB > wA:
+                            self.handshake_pool = "B"
+                        else:
+                            self.handshake_pool = "A"
+
+                # Mark that we expect a raw subscribe result from the active pool
+                self.expect_raw_subscribe = True
+
+                await self.send_upstream(self.handshake_pool, msg)
+                continue
+
+
+            if m == "mining.authorize":
+                self.authorize_id = msg.get("id")
+                if self.handshake_pool is None:
+                    # Choose handshake pool intelligently:
+                    # Prefer the pool with the larger en2_size, else fall back to weights.
+                    try:
+                        wA = float(getattr(self.cfg.sched, "wA", 0))
+                        wB = float(getattr(self.cfg.sched, "wB", 0))
+                    except Exception:
+                        wA, wB = 1.0, 0.0
+                    if wA <= 0 and wB > 0:
+                        self.handshake_pool = "B"
+                    elif wB <= 0 and wA > 0:
+                        self.handshake_pool = "A"
+                    else:
+                        _en2a = self.extranonce2_size.get("A")
+                        _en2b = self.extranonce2_size.get("B")
+                        if _en2a is not None and _en2b is not None and _en2a != _en2b:
+                            if _en2a < _en2b:
+                                self.handshake_pool = "A"
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                    pool="A", en2a=_en2a, en2b=_en2b)
+                            else:
+                                self.handshake_pool = "B"
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                    pool="B", en2a=_en2a, en2b=_en2b)
+                        elif wB > wA:
+                            self.handshake_pool = "B"
+                        else:
+                            self.handshake_pool = "A"
+
+                # Send rewritten authorize to the handshake pool (primary) AND the other pool (secondary)
+                primary = self.handshake_pool
+                secondary = "B" if primary == "A" else "A"
+
+                if primary == "A":
+                    out_primary = self.rewrite_authorize(self.cfg.poolA, msg)
+                    out_secondary = self.rewrite_authorize(self.cfg.poolB, msg)
+                else:
+                    out_primary = self.rewrite_authorize(self.cfg.poolB, msg)
+                    out_secondary = self.rewrite_authorize(self.cfg.poolA, msg)
+
+                log("authorize_rewrite", pool=primary, worker=self.worker, upstream_user=out_primary["params"][0])
+                await self.send_upstream(primary, out_primary)
+
+                # Also authorize to the other pool so its UI shows the real worker name (not dpmp_bootstrap).
+                # Skip if the other pool has zero weight (not connected).
+                other = "B" if self.handshake_pool == "A" else "A"
+                other_w = getattr(self.cfg.sched, "wB" if other == "B" else "wA", 0)
+                if other_w > 0:
+                    try:
+                        ocfg = self.cfg.poolB if other == "B" else self.cfg.poolA
+                        out2 = self.rewrite_authorize(ocfg, msg)
+                        log("authorize_rewrite_other", pool=other, worker=self.worker, upstream_user=out2["params"][0])
+                        await self.send_upstream(other, out2)
+                    except Exception as e:
+                        log("authorize_rewrite_other_error", pool=other, worker=self.worker, err=str(e))
+
+                    # Ensure pools that key UI on authorize see the real miner worker name.
+                    try:
+                        log("authorize_rewrite_secondary", pool=secondary, worker=self.worker, upstream_user=out_secondary["params"][0])
+                        await self.send_upstream(secondary, out_secondary)
+                    except Exception as e:
+                        log("authorize_secondary_send_error", sid=self.sid, pool=secondary, err=str(e))
+                else:
+                    log("authorize_skip_zero_weight_pool", sid=self.sid, pool=other)
+
+                self.miner_ready.set()
+                log("miner_ready_for_jobs", sid=self.sid, worker=self.worker, handshake_pool=self.handshake_pool)
+
+                # Immediately push extranonce+diff so the miner has correct targets before submitting.
+                # Skip extranonce if the miner already received it via raw subscribe response
+                # (avoids mining.set_extranonce to miners that don't support it like NerdAxe).
+                try:
+                    if getattr(self, "raw_subscribe_forwarded_pool", None) != self.handshake_pool:
+                        await self.maybe_send_downstream_extranonce(self.handshake_pool)
+                    else:
+                        log("post_auth_extranonce_skip_raw_subscribe", sid=self.sid, pool=self.handshake_pool)
+                    await self.maybe_send_downstream_diff(self.handshake_pool)
+                    log("post_auth_downstream_sync", sid=self.sid, pool=self.handshake_pool)
+                except Exception as e:
+                    log("post_auth_downstream_sync_error", sid=self.sid, pool=self.handshake_pool, err=str(e))
+
+                continue
+
+            if m == "mining.submit":
+                # Guard: swallow submits until the miner has received at least
+                # one mining.notify in this session.  Miners buffer work
+                # internally and blast stale shares from a previous session on
+                # reconnect.  Rather than forwarding them upstream (where they
+                # will be rejected), we return a fake "accepted" so the miner
+                # stays happy and the reject counters stay clean.
+                if not self._session_ready:
+                    log("submit_swallowed_not_ready", sid=self.sid,
+                        mid=msg.get("id"), jid=jobid_from_submit(msg))
+                    await write_line(self.miner_w, dumps_json({
+                        "id": msg.get("id"), "result": True, "error": None
+                    }), "downstream")
+                    continue
+
+                # Soft-paused miners: swallow shares with fake "accepted"
+                # so the miner stays happy but hashrate drops to zero.
+                if self.worker and self.worker in get_paused_miners():
+                    await write_line(self.miner_w, dumps_json({
+                        "id": msg.get("id"), "result": True, "error": None
+                    }), "downstream")
+                    continue
+
+                # Submit suppression during pool switch: shares submitted in the
+                # brief window between set_extranonce and the new clean notify
+                # are almost always stale.  Swallow them with a fake "accepted".
+                if self.block_submits:
+                    log("submit_suppressed_during_switch", sid=self.sid,
+                        mid=msg.get("id"), jid=jobid_from_submit(msg))
+                    await write_line(self.miner_w, dumps_json({
+                        "id": msg.get("id"), "result": True, "error": None
+                    }), "downstream")
+                    continue
+
+                SHARES_SUBMITTED.inc()
+                jid = jobid_from_submit(msg)
+                pool = "A"
+                reason = "default_A"
+                if jid is None:
+                    # Some miners/pools may omit/obscure jobid in submit; fall back to last forwarded pool.
+                    if self.last_forwarded_pool in ("A","B"):
+                        pool = self.last_forwarded_pool
+                        reason = "no_jid_fallback"
+                else:
+                    # Prefer stable job->pool mapping first (critical during pool switching).
+                    pool_map = self.job_owner.get(("A", jid)) or self.job_owner.get(("B", jid))
+                    if pool_map in ("A","B"):
+                        pool = pool_map
+                        reason = "job_owner_map"
+                    # Layer 3: Grace window -- accept shares for recently-expired jobs
+                    # so in-flight work survives pool switches without rejection bursts.
+                    elif not pool_map:
+                        now_mono = time.monotonic()
+                        grace_a = self.job_valid_until.get(("A", jid))
+                        grace_b = self.job_valid_until.get(("B", jid))
+                        if grace_a and now_mono < grace_a:
+                            pool = "A"
+                            reason = "job_grace_window"
+                            log("submit_grace_window_hit", sid=self.sid, jid=jid, pool="A",
+                                remaining=round(grace_a - now_mono, 2))
+                        elif grace_b and now_mono < grace_b:
+                            pool = "B"
+                            reason = "job_grace_window"
+                            log("submit_grace_window_hit", sid=self.sid, jid=jid, pool="B",
+                                remaining=round(grace_b - now_mono, 2))
+                        elif self.last_forwarded_jobid == jid and self.last_forwarded_pool in ("A","B"):
+                            pool = self.last_forwarded_pool
+                            reason = "last_forwarded_match"
+                        elif self.last_forwarded_pool in ("A","B"):
+                            # If miner submits a jid we never forwarded/mapped, do NOT forward upstream.
+                            # Avoid upstream "job not found" churn (seen on Nano3S right after connect).
+                            if self.last_forwarded_jobid is not None and jid != self.last_forwarded_jobid:
+                                log("submit_dropped_unknown_jid", sid=self.sid, mid=msg.get("id"), jid=jid,
+                                    last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
+                                await write_line(self.miner_w, dumps_json({"id": msg.get("id"), "result": False,
+                                    "error": {"code": 21, "message": "job not found", "data": None}}), "downstream")
+                                continue
+                            pool = self.last_forwarded_pool
+                            reason = "last_forwarded_pool_fallback"
+
+                log("submit_route", sid=self.sid, jid=jid, pool=pool, reason=reason,
+                    last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
+                # Dedupe: miners sometimes retry identical submits (timeout / reconnect).
+                # Forwarding duplicates upstream produces "Duplicate share" rejects.
+                try:
+                    pms = msg.get("params") or []
+                    # Params: [user, jobid, extranonce2, ntime, nonce, (optional) versionbits]
+                    fp = (
+                        str(pms[1]) if len(pms) > 1 else None,
+                        str(pms[2]) if len(pms) > 2 else None,
+                        str(pms[3]) if len(pms) > 3 else None,
+                        str(pms[4]) if len(pms) > 4 else None,
+                        str(pms[5]) if len(pms) > 5 else None,
+                    )
+                    now = time.monotonic()
+                    mfp = self.submit_fp_last.get(pool)
+                    if mfp is None:
+                        mfp = {}
+                        self.submit_fp_last[pool] = mfp
+                    ttl = float(getattr(self, "submit_fp_ttl_s", 45.0) or 45.0)
+                    if mfp:
+                        old = [k for k,v in mfp.items() if (now - float(v)) > ttl]
+                        for k in old:
+                            mfp.pop(k, None)
+                    mx = int(getattr(self, "submit_fp_max", 512) or 512)
+                    if len(mfp) > mx:
+                        for k,_v in sorted(mfp.items(), key=lambda kv: kv[1])[: max(1, len(mfp) - mx)]:
+                            mfp.pop(k, None)
+                    last = mfp.get(fp)
+                    if last is not None and (now - float(last)) <= ttl:
+                        log("submit_dropped_duplicate_fp", sid=self.sid, mid=msg.get("id"), jid=jid, pool=pool)
+                        # Send fake success instead of error for duplicates.
+                        # The original share was already forwarded upstream.
+                        # Fragile miners (BM-101) treat any error as fatal and disconnect.
+                        await write_line(self.miner_w, dumps_json({"id": msg.get("id"), "result": True,
+                            "error": None}), "downstream")
+                        continue
+
+                    mfp[fp] = now
+                except Exception as e:
+                    log("submit_dedupe_error", sid=self.sid, err=str(e))
+
+
+                # Guard: reject submits if miner extranonce context doesn't match target pool.
+                # If we recently sent mining.set_extranonce for the other pool, the miner may be
+                # building shares against the wrong extranonce1, which will produce mass rejects.
+                ex_pool = getattr(self, "last_downstream_extranonce_pool", None)
+                if ex_pool in ("A", "B") and ex_pool != pool:
+                    age = None
+                    if self.last_switch_mono is not None:
+                        age = time.monotonic() - float(self.last_switch_mono)
+
+                    if age is not None and age < dpmp_fleet.miner_grace_window_s(
+                            dpmp_fleet.fleet_state.get("miners", {}).get(
+                                str(self.sid), {}).get("hashrate_ths", 5.0)):
+                        # Grace window: allow in-flight submits for the previous pool job to be forwarded.
+                        # We route by job ownership (target_pool=pool). Rejecting here creates unnecessary drops.
+                        log("submit_extranonce_mismatch_grace_forward", sid=self.sid, mid=msg.get("id"), jid=jid,
+                            target_pool=pool, last_extranonce_pool=ex_pool, age_s=round(age, 3))
+                    else:
+                        log("submit_dropped_extranonce_mismatch", sid=self.sid, mid=msg.get("id"), jid=jid,
+                            target_pool=pool, last_extranonce_pool=ex_pool,
+                            last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
+                        await write_line(self.miner_w, dumps_json({"id": msg.get("id"), "result": False,
+                            "error": {"code": 23, "message": "stale extranonce context", "data": None}}), "downstream")
+                        continue
+
+                self.submit_owner[msg.get("id")] = pool
+                mid = msg.get("id")
+                _true_diff = 0.0
+                if mid is not None:
+                    d = self.last_downstream_diff_by_pool.get(pool)
+                    # Submit-time snapshot for debugging diff mismatches (VarDiff / miner apply lag).
+                    pms = msg.get("params") or []
+                    u0 = pms[0] if len(pms) > 0 else None
+                    en2 = pms[2] if len(pms) > 2 else None
+                    ntime = pms[3] if len(pms) > 3 else None
+                    nonce = pms[4] if len(pms) > 4 else None
+                    # versionbits is optional (only for version-rolling miners)
+                    vb = pms[5] if len(pms) > 5 else None
+
+                    log("submit_snapshot", sid=self.sid, jid=jid, pool=pool, mid=mid,
+                        user=u0, extranonce2=en2, ntime=ntime, nonce=nonce, versionbits=vb,
+                        active=(self.last_forwarded_pool or self.handshake_pool),
+                        raw_subscribe_forwarded_pool=getattr(self, "raw_subscribe_forwarded_pool", None),
+                        last_downstream_diff_snapshot=d, pool_latest_diff=self.latest_diff.get(pool),
+                        last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
+
+                    # Calculate true share difficulty from block header hash.
+                    # Look up the cached mining.notify params for this job,
+                    # combine with mining.submit params, reconstruct the header,
+                    # SHA256d it, and compute pdiff.
+                    _true_diff = 0.0
+                    try:
+                        # Look up notify params for this job (try both pools)
+                        _jnc = (self.job_notify_cache.get((pool, jid))
+                                or self.job_notify_cache.get(("A", jid))
+                                or self.job_notify_cache.get(("B", jid)))
+                        _en1 = self.extranonce1.get(_jnc["pool"] if _jnc else pool)
+                        if _jnc and _en1 and en2 and ntime and nonce:
+                            _true_diff = dpmp_fleet.calc_share_difficulty(
+                                version_hex=_jnc["version"],
+                                prevhash_hex=_jnc["prevhash"],
+                                coinb1_hex=_jnc["coinb1"],
+                                coinb2_hex=_jnc["coinb2"],
+                                merkle_branches=_jnc["merkle"],
+                                nbits_hex=_jnc["nbits"],
+                                ntime_hex=ntime,
+                                extranonce1_hex=_en1,
+                                extranonce2_hex=en2,
+                                nonce_hex=nonce,
+                                versionbits_hex=vb,
+                            )
+                    except Exception as e:
+                        log("share_diff_calc_error", sid=self.sid, err=str(e))
+
+                    # Store both diffs: downstream (for hashrate calc) and true (for best share)
+                    if d is None:
+                        d = self.latest_diff.get(pool)
+                    self.submit_diff[mid] = float(d or 0.0)
+                    self.submit_true_diff[mid] = _true_diff
+                    # Record submit time for VarDiff suppression -- we need
+                    # to check grace window against when the share was SENT,
+                    # not when the pool's response arrives (could be 1-2s later).
+                    self.submit_mono[mid] = time.monotonic()
+                    if self.last_switch_mono is not None:
+                        self.submit_switch_mono[mid] = self.last_switch_mono
+
+                # True-diff filter: if we successfully computed the share's
+                # actual difficulty and it falls below what the pool requires,
+                # the pool WILL reject it as "low difficulty share".  Swallow
+                # it here and return fake "accepted" to the miner.  This
+                # catches pipeline shares built at an old (lower) difficulty
+                # that haven't cleared the miner's buffer yet -- common after
+                # startup pool assignment or mid-session switches.
+
+                if _true_diff >= 1:
+                    _pool_required = self.latest_diff.get(pool) or 0.0
+                    if _pool_required > 0 and _true_diff < _pool_required * 0.95:
+                        _td_suppressed = getattr(self, "_truediff_suppressed", 0)
+                        self._truediff_suppressed = _td_suppressed + 1
+                        if _td_suppressed == 0 or _td_suppressed % 50 == 0:
+                            log("submit_suppressed_true_diff", sid=self.sid,
+                                mid=mid, jid=jid, pool=pool,
+                                true_diff=round(_true_diff, 2),
+                                pool_diff=_pool_required,
+                                suppressed_count=_td_suppressed + 1)
+
+                        self.submit_owner.pop(mid, None)
+                        self.submit_diff.pop(mid, None)
+                        self.submit_mono.pop(mid, None)
+                        self.submit_switch_mono.pop(mid, None)
+                        self.submit_true_diff.pop(mid, None)
+
+                        await write_line(self.miner_w, dumps_json({
+                            "id": msg.get("id"), "result": True, "error": None
+                        }), "downstream")
+                        continue
+
+
+
+                # Failover guard: reject submit if target pool is dead 
+                # If the pool that owns this job just died, we can't forward
+                # the share.  Send the miner a clean rejection instead of
+                # crashing on a None writer.
+                if not self.pool_alive.get(pool, False):
+                    log("submit_dropped_pool_dead", sid=self.sid, mid=msg.get("id"),
+                        jid=jid, pool=pool)
+
+                    self.submit_owner.pop(msg.get("id"), None)
+                    self.submit_diff.pop(msg.get("id"), None)
+                    self.submit_mono.pop(msg.get("id"), None)
+                    self.submit_switch_mono.pop(msg.get("id"), None)
+
+                    self.submit_true_diff.pop(msg.get("id"), None)
+                    await write_line(self.miner_w, dumps_json({
+                        "id": msg.get("id"), "result": False,
+                        "error": {"code": 21, "message": "pool unavailable", "data": None}
+                    }), "downstream")
+                    continue
+
+                # Low-diff suppression: after a pool switch, the miner may
+                # have a pipeline of shares built at the old (lower) pool's
+                # difficulty.  These will be rejected by the new pool as
+                # "low difficulty share".  Instead of forwarding them upstream
+                # (where they waste bandwidth and inflate reject counters),
+                # we silently absorb them and send a fake "accepted" back to
+                # the miner.  This only applies during a brief grace window
+                # after a switch, so normal VarDiff adjustments are unaffected.
+                #
+                # We compare the share's expected difficulty (what we last
+                # sent downstream for this pool) against the pool's current
+                # required difficulty.  If our downstream diff is less than
+                # 50% of the pool's diff, the share will almost certainly be
+                # rejected as low-diff.
+                _switch_age = None
+                if self.last_switch_mono is not None:
+                    _switch_age = time.monotonic() - self.last_switch_mono
+                if _switch_age is not None and _switch_age < dpmp_fleet.miner_grace_window_s(
+                        dpmp_fleet.fleet_state.get("miners", {}).get(
+                            str(self.sid), {}).get("hashrate_ths", 5.0)):
+                    _pool_diff = self.latest_diff.get(pool) or 0.0
+                    _our_diff = self.last_downstream_diff_by_pool.get(pool) or 0.0
+                    # Only suppress if we know both diffs and ours is way below pool's
+                    if _pool_diff > 0 and _our_diff > 0 and _our_diff < _pool_diff * 0.5:
+                        _suppressed = getattr(self, "_lowdiff_suppressed", 0)
+                        self._lowdiff_suppressed = _suppressed + 1
+                        # Log once per burst (first suppression and then every 50th)
+                        if _suppressed == 0 or _suppressed % 50 == 0:
+                            log("submit_suppressed_low_diff", sid=self.sid,
+                                mid=msg.get("id"), jid=jid, pool=pool,
+                                our_diff=_our_diff, pool_diff=_pool_diff,
+                                switch_age_s=round(_switch_age, 2),
+                                suppressed_count=_suppressed + 1)
+                        # Send fake "accepted" so the miner does not slow down or error
+                        self.submit_owner.pop(msg.get("id"), None)
+                        self.submit_diff.pop(msg.get("id"), None)
+                        self.submit_mono.pop(msg.get("id"), None)
+                        self.submit_true_diff.pop(msg.get("id"), None)
+                        await write_line(self.miner_w, dumps_json({
+                            "id": msg.get("id"), "result": True, "error": None
+                        }), "downstream")
+                        continue
+                else:
+                    # Outside grace window: reset suppression counter
+                    if getattr(self, "_lowdiff_suppressed", 0) > 0:
+                        log("submit_suppressed_low_diff_end", sid=self.sid,
+                            pool=pool, total_suppressed=self._lowdiff_suppressed)
+                        self._lowdiff_suppressed = 0
+
+                if pool == "B":
+                    out = dict(msg)
+                    params = list(out.get("params") or [])
+                    if params:
+                        # submit user should match pool wallet + miner worker
+                        params[0] = f"{self.cfg.poolB.wallet}.{self.worker}" if self.cfg.poolB.wallet else str(params[0])
+                        # Keep versionbits if present (miners may be version-rolling).
+                        out["params"] = params
+                    # --- Stats tab: record submit time for latency measurement ---
+                    dpmp_fleet.pool_record_submit_time(msg.get("id"), "B")
+                    await write_line(self.wB, dumps_json(out), "upstreamB")
+                else:
+                    out = dict(msg)
+                    params = list(out.get("params") or [])
+                    if params:
+                        # submit user should match pool wallet + miner worker
+                        params[0] = f"{self.cfg.poolA.wallet}.{self.worker}" if self.cfg.poolA.wallet else str(params[0])
+                        # Keep versionbits if present (miners may be version-rolling).
+                        out["params"] = params
+                    # --- Stats tab: record submit time for latency measurement ---
+                    dpmp_fleet.pool_record_submit_time(msg.get("id"), "A")
+                    await write_line(self.wA, dumps_json(out), "upstreamA")
+                continue
+
+            if self.wA is not None:
+                await write_line(self.wA, raw, "upstreamA")
+            if self.wB is not None:
+                await write_line(self.wB, raw, "upstreamB")
+
+    # Read from upstream pool
+    async def pool_reader(self, pool_key: str, reader: asyncio.StreamReader):
+        side = "upstreamA" if pool_key == "A" else "upstreamB"
+        async for raw in iter_lines(reader, side):
+            try:
+                msg = loads_json(raw)
+            except Exception:
+                continue
+
+            method = msg.get("method")
+
+            mid = msg.get("id")
+
+            if mid is not None and method is None:
+
+                if (pool_key, mid) in self.seen_upstream_response_ids:
+
+                    log("upstream_response_dup_observed", sid=self.sid, pool=pool_key, id=mid)
+                    continue
+
+                self.seen_upstream_response_ids.add((pool_key, mid))
+
+            if method == "mining.set_difficulty":
+                # Track upstream diff, but DO NOT forward directly to miner.
+                # Downstream difficulty is sent only by the scheduler path to avoid race/mismatch.
+                try:
+                    v = float((msg.get("params") or [None])[0])
+                    self.latest_diff[pool_key] = v
+                    log("pool_diff", pool=pool_key, diff=self.latest_diff[pool_key])
+
+                    # Reset VarDiff ramp suppression -- but only if this diff update
+                    # is from the same pool that's generating the rejects.
+                    if pool_key == self._vardiff_ramp_pool:
+                        if self._vardiff_ramp_suppressed > 0:
+                            log("vardiff_ramp_suppress_ended_new_diff", sid=self.sid,
+                                pool=pool_key, new_diff=v,
+                                total_suppressed=self._vardiff_ramp_suppressed)
+                        self._vardiff_ramp_consec_rejects = 0
+                        self._vardiff_ramp_suppressed = 0
+                except Exception:
+                    pass
+                continue
+
+            if method == "mining.notify":
+                # Cache notify; scheduler is the ONLY code path that forwards notify downstream
+                # (it forces clean_jobs=True and sends extranonce/diff first).
+                self.latest_notify_raw[pool_key] = raw
+                jid = jobid_from_notify(msg)
+                self.latest_jobid[pool_key] = jid
+                self.notify_seq[pool_key] += 1
+                # Clear unresponsive state -- pool is now sending valid work.
+                dpmp_fleet.pool_record_job_received(pool_key)
+
+                # Cache parsed params for share difficulty calculation.
+                # mining.notify params: [jobid, prevhash, coinb1, coinb2,
+                #   merkle_branches, version, nbits, ntime, clean_jobs]
+                try:
+                    np = msg.get("params") or []
+                    if len(np) >= 8 and jid:
+                        self.job_notify_cache[(pool_key, jid)] = {
+                            "prevhash": str(np[1]),
+                            "coinb1": str(np[2]),
+                            "coinb2": str(np[3]),
+                            "merkle": list(np[4]) if isinstance(np[4], list) else [],
+                            "version": str(np[5]),
+                            "nbits": str(np[6]),
+                            "ntime": str(np[7]),
+                            "pool": pool_key,
+                        }
+                        # Limit cache to last 20 jobs to prevent memory leaks
+                        if len(self.job_notify_cache) > 20:
+                            oldest = next(iter(self.job_notify_cache))
+                            del self.job_notify_cache[oldest]
+                except Exception:
+                    pass
+
+                log("pool_notify", sid=self.sid, pool=pool_key, jobid=jid, seq=self.notify_seq[pool_key])
+                continue
+
+            if "id" in msg and msg.get("method") is None:
+                mid = msg.get("id")
+
+                # INTERNAL bootstrap traffic: process but DO NOT forward to miner.
+                if isinstance(mid, int) and mid in getattr(self, "_internal_ids", set()):
+                    if getattr(self, "_internal_subscribe_id", {}).get(pool_key) == mid:
+                        try:
+                            res = msg.get("result")
+                            # Typical subscribe result: [ [..], extranonce1, extranonce2_size ]
+                            if isinstance(res, list) and len(res) >= 3:
+                                en1 = res[1]
+                                en2s = res[2]
+                                if en1 is not None:
+                                    self.extranonce1[pool_key] = str(en1)
+                                if en2s is not None:
+                                    self.extranonce2_size[pool_key] = int(en2s)
+                                    EN2_SIZE.labels(pool=pool_key).set(int(en2s))
+
+                                log("pool_bootstrap_subscribe_result", sid=self.sid, pool=pool_key,
+                                    extranonce1=self.extranonce1[pool_key],
+                                    extranonce2_size=self.extranonce2_size[pool_key],
+                                    locked_en2_size=self.locked_en2_size)
+                        except Exception as e:
+                            log("pool_bootstrap_subscribe_parse_error", sid=self.sid, pool=pool_key, err=str(e))
+                    if getattr(self, "_internal_authorize_id", {}).get(pool_key) == mid:
+                        log("pool_bootstrap_auth_result", sid=self.sid, pool=pool_key,
+                            ok=bool(msg.get("result")), error=msg.get("error"))
+                    continue
+
+                # Capture per-pool subscribe response (extranonce context)
+                if self.subscribe_id is not None and mid == self.subscribe_id:
+
+                    # Parse extranonce data from this pool's subscribe result
+                    _sub_en1 = None
+                    _sub_en2s = None
+                    try:
+                        res = msg.get("result")
+                        if isinstance(res, list) and len(res) >= 3:
+                            _sub_en1 = res[1]
+                            _sub_en2s = res[2]
+                            if _sub_en1 is not None:
+                                self.extranonce1[pool_key] = str(_sub_en1)
+                            if _sub_en2s is not None:
+                                self.extranonce2_size[pool_key] = int(_sub_en2s)
+                                EN2_SIZE.labels(pool=pool_key).set(int(_sub_en2s))
+
+                            # Lock en2_size to the LARGER of the two pools' values.
+                            # The miner will use this size for all work in this session.
+                            # Larger is safer: miners handle extension (padding with
+                            # zeros) better than truncation, and pools generally accept
+                            # submissions with en2 longer than advertised.
+                            if self.locked_en2_size is None:
+                                other_pool = "B" if pool_key == "A" else "A"
+                                other_en2 = self.extranonce2_size.get(other_pool)
+                                this_en2 = int(_sub_en2s)
+                                if other_en2 is not None and self.cfg.sched.force_reconnect_on_en2_mismatch:
+                                    # When force_reconnect is enabled, each session reconnects
+                                    # fresh to a specific pool -- lock to that pool's native
+                                    # en2 size so strict pools like PublicPool get correctly
+                                    # sized extranonce2 values.
+                                    self.locked_en2_size = this_en2
+                                elif other_en2 is not None:
+                                    self.locked_en2_size = max(this_en2, int(other_en2))
+                                else:
+                                    # Other pool hasn't subscribed yet; lock to this one
+                                    self.locked_en2_size = this_en2
+
+                                log("en2_size_locked", sid=self.sid, pool=pool_key,
+                                    locked_en2_size=self.locked_en2_size,
+                                    this_pool_en2=this_en2,
+                                    other_pool=other_pool,
+                                    other_pool_en2=other_en2)
+
+                            log("subscribe_result", pool=pool_key,
+                                extranonce1=self.extranonce1[pool_key],
+                                extranonce2_size=self.extranonce2_size[pool_key],
+                                locked_en2_size=self.locked_en2_size)
+                    except Exception as e:
+                        log("subscribe_parse_error", pool=pool_key, err=str(e))
+
+                    # Raw-forward subscribe result for the active pool (pool-agnostic)
+                    # BUT rewrite en2_size to the locked session value if different.
+                    active = self.last_forwarded_pool or self.handshake_pool
+                    if active == pool_key:
+                        # Rewrite en2_size in the subscribe result before forwarding
+                        if (self.locked_en2_size is not None and _sub_en2s is not None
+                                and int(_sub_en2s) != self.locked_en2_size):
+                            try:
+                                rewritten = dict(msg)
+                                rr = list(rewritten.get("result", []))
+                                if len(rr) >= 3:
+                                    rr[2] = self.locked_en2_size
+                                    rewritten["result"] = rr
+                                    await write_line(self.miner_w, dumps_json(rewritten), "downstream")
+                                    log("downstream_subscribe_forwarded_rewritten", sid=self.sid,
+                                        pool=pool_key, upstream_en2s=int(_sub_en2s),
+                                        locked_en2s=self.locked_en2_size)
+                                else:
+                                    await write_line(self.miner_w, raw, "downstream")
+                                    log("downstream_subscribe_forwarded_raw", sid=self.sid, pool=pool_key)
+                            except Exception:
+                                await write_line(self.miner_w, raw, "downstream")
+                                log("downstream_subscribe_forwarded_raw", sid=self.sid, pool=pool_key)
+                        else:
+                            await write_line(self.miner_w, raw, "downstream")
+                            log("downstream_subscribe_forwarded_raw", sid=self.sid, pool=pool_key)
+                        self.raw_subscribe_forwarded_pool = pool_key
+
+                        # If we had to buffer a notify waiting for subscribe, flush it now.
+                        try:
+                            raw_n = self.latest_notify_raw.get(pool_key)
+                            if raw_n:
+                                # await write_line(self.miner_w, raw_n, "downstream")
+                                log("downstream_notify_flushed_after_subscribe", sid=self.sid, pool=pool_key)
+                        except Exception:
+                            pass
+
+                if self.authorize_id is not None and mid == self.authorize_id:
+                    ok_auth = bool(msg.get("result"))
+                    log("auth_result", pool=pool_key, ok=ok_auth, error=msg.get("error"))
+
+                    # Step A: after authorize OK (handshake pool), immediately push setup context in correct order:
+                    # set_extranonce -> set_difficulty -> notify(clean_jobs=true)
+                    # BUT skip if scheduler already switched to the other pool (don't overwrite Pool A's context)
+                    last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
+                    already_switched_away = (last_en_pool is not None and last_en_pool != pool_key)
+                    if ok_auth and (self.handshake_pool is not None) and (pool_key == self.handshake_pool) and (not already_switched_away):
+                        try:
+                            # Extranonce (if known)
+                            # Skip if we already raw-forwarded the subscribe response for this pool 
+                            # the miner already has the extranonce.  Sending mining.set_extranonce
+                            # to miners that don't support it (NerdAxe, NerdMiner, etc.) causes
+                            # disconnect/reboot loops.
+                            en1 = self.extranonce1.get(pool_key)
+                            en2s = self.extranonce2_size.get(pool_key)
+                            # Use locked en2_size for downstream consistency
+                            _en2s_downstream = self.locked_en2_size if self.locked_en2_size is not None else (int(en2s) if en2s is not None else None)
+                            if en1 is not None and _en2s_downstream is not None:
+                                if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+                                    log("post_auth_extranonce_skip_already_in_subscribe", sid=self.sid, pool=pool_key,
+                                        extranonce1=str(en1), extranonce2_size=_en2s_downstream)
+                                else:
+                                    en_msg = {"method": "mining.set_extranonce", "params": [str(en1), _en2s_downstream]}
+                                    log("post_auth_push_extranonce", sid=self.sid, pool=pool_key,
+                                        extranonce1=str(en1), extranonce2_size=_en2s_downstream,
+                                        locked_en2_size=self.locked_en2_size)
+                                    await write_line(self.miner_w, dumps_json(en_msg), "downstream")
+
+                            # Difficulty (use downstream_diff_policy to respect
+                            # configured min/max floors -- raw pool diff may be
+                            # too low during VarDiff ramp, e.g. Bassin starting
+                            # at diff 42 for an 80 TH/s miner)
+                            diff = self.downstream_diff_policy(pool_key)
+                            if diff is not None and diff > 0:
+                                dmsg = {"method": "mining.set_difficulty", "params": [int(diff)]}
+                                log("post_auth_push_diff", sid=self.sid, pool=pool_key, diff=diff, diff_sent=int(diff))
+                                await write_line(self.miner_w, dumps_json(dmsg), "downstream")
+
+                            # Notify (force clean_jobs=true)
+                            raw_n = self.latest_notify_raw.get(pool_key)
+                            if raw_n:
+                                try:
+                                    n = loads_json(raw_n)
+                                    if isinstance(n, dict) and n.get("method") == "mining.notify" and isinstance(n.get("params"), list) and len(n["params"]) >= 1:
+                                        n["params"][-1] = True
+                                        log("post_auth_push_notify_clean", sid=self.sid, pool=pool_key)
+                                        await write_line(self.miner_w, dumps_json(n), "downstream")
+                                        # Commit forwarded-job state for submit routing (post-auth path must mirror resend/scheduler path)
+                                        jid = None
+                                        try:
+                                            if isinstance(n, dict):
+                                                ps = n.get("params")
+                                                if isinstance(ps, list) and len(ps) >= 1:
+                                                    jid = ps[0]
+                                        except Exception:
+                                            jid = None
+                                        self.last_forwarded_pool = pool_key
+                                        self.last_forwarded_jobid = jid
+                                        if not self._session_ready:
+                                            self._session_ready = True
+                                            log("session_ready", sid=self.sid, pool=pool_key, jobid=jid)
+                                        if jid:
+                                            self._commit_job(pool_key, jid)
+                                        self.last_notify_mono[pool_key] = time.monotonic()
+                                except Exception as e:
+                                    log("post_auth_push_notify_clean_error", sid=self.sid, pool=pool_key, err=str(e))
+                        except Exception as e:
+                            log("post_auth_push_setup_error", sid=self.sid, pool=pool_key, err=str(e))
+
+                # Forward subscribe/auth responses ONLY from the selected handshake pool
+                if mid not in self.submit_owner:
+                    if (mid not in self.submit_owner) and (self.handshake_pool is not None and pool_key != self.handshake_pool):
+                        log("handshake_response_dropped", sid=self.sid, pool=pool_key, id=mid, chosen=self.handshake_pool)
+                        continue
+
+                log("id_response_seen", sid=self.sid, pool=pool_key, id=mid, in_submit_owner=(mid in self.submit_owner), handshake_pool=self.handshake_pool)
+                # If we already raw-forwarded the subscribe response for this pool,
+                # do NOT also forward it again via the generic id-response path.
+                if self.subscribe_id is not None and mid == self.subscribe_id and getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+                    log("subscribe_id_response_skipped_duplicate", sid=self.sid, pool=pool_key, id=mid)
+                    continue
+
+                if mid in self.submit_owner:
+                    p = self.submit_owner.pop(mid)
+                    d = float(self.submit_diff.pop(mid, 0.0))
+                    _submit_ts = self.submit_mono.pop(mid, 0.0)
+                    _true_d = float(self.submit_true_diff.pop(mid, 0.0))
+                    ok = bool(msg.get("result"))
+
+                    # --- Stats tab: pool latency (submit -> result round-trip) ---
+                    dpmp_fleet.pool_record_result_time(mid)
+
+                    if ok:
+                        SHARES_ACCEPTED.labels(pool=p).inc()
+                        ACCEPTED_DIFFICULTY_SUM.labels(pool=p).inc(d)
+                        # --- Rolling ratio window (v3 Phase 1a) ---
+                        dpmp_fleet.ratio_window_record(p, d)
+                        log("share_result", sid=self.sid, pool=p, accepted=True, diff=d)
+
+                        # Reset VarDiff ramp consecutive reject counter on accept
+                        if self._vardiff_ramp_consec_rejects > 0:
+                            if self._vardiff_ramp_suppressed > 0:
+                                log("vardiff_ramp_suppress_ended_accept", sid=self.sid,
+                                    pool=p, total_suppressed=self._vardiff_ramp_suppressed)
+                            self._vardiff_ramp_consec_rejects = 0
+                            self._vardiff_ramp_suppressed = 0
+
+                        # Post-switch accept tracking (for auto-pin detection)
+                        # Only count accepts on the pool we switched TO, not the prior pool
+
+                        if self.last_switch_mono is not None and p == self.active_pool:
+                            self._post_switch_accepts += 1
+                            # Start the slice timer on the first accepted share.
+                            # This ensures the slice duration is measured from
+                            # productive hashing time, not from disconnect time.
+                            # Particularly important for Dynamic miners with
+                            # force reconnect enabled, where VarDiff ramp-up
+                            # can consume most of the slice window.
+                            if not self._slice_timer_started:
+                                self._slice_timer_started = True
+                                log("slice_timer_started", sid=self.sid,
+                                    pool=p, worker=self.worker or "unknown")
+
+                            # Safety valve: if the miner got an accept after a switch,
+                            # it handled the extranonce change correctly.  Clear any
+                            # accumulated en1 mismatch count so it doesn't slowly
+                            # build toward a false pin over many sessions.
+                            if self._post_switch_en1_mismatch > 0:
+                                self._post_switch_en1_mismatch = 0
+                                dpmp_fleet.en1_mismatch_carry_clear(
+                                    self.worker or "unknown")
+                            # Also clear reconnect-switch tracking -- but only after the
+                            # miner has demonstrated reliable operation on the new pool
+                            # (5+ accepts required).  A single lucky accept is not enough
+                            # evidence -- miners with en2 size mismatches can occasionally
+                            # get accepts through before the incompatibility becomes apparent.
+                            if self._post_switch_accepts >= 5:
+                                try:
+                                    _peer_ok = self.miner_w.get_extra_info("peername")
+                                    if _peer_ok:
+                                        dpmp_fleet.reconnect_switch_clear(_peer_ok[0])
+                                except Exception:
+                                    pass
+
+                        # Update this miner's fleet weight based on share difficulty.
+                        dpmp_fleet.fleet_update_weight(str(self.sid), d)
+
+                        # --- Stats tab: per-worker share tracking ---
+                        try:
+                            wn = self.worker or "unknown"
+                            dpmp_fleet.worker_record_share(wn, d, True, true_diff=_true_d, pool_key=p)
+                        except Exception:
+                            pass
+                        # If this miner had en2 strikes and just accepted a share
+                        # within the strike window, it handled the change fine --
+                        # reset its consecutive strike counter.
+                        try:
+                            _peer = self.miner_w.get_extra_info("peername")
+                            if _peer and dpmp_fleet.has_recent_en2_hint(_peer[0]):
+                                dpmp_fleet.reset_en2_strikes(_peer[0])
+                        except Exception:
+                            pass
+
+                    else:
+                        # --- VarDiff reject suppression (Phase 5) ---
+                        # Check suppression FIRST, before incrementing any reject
+                        # counters.  Suppressed rejects should not appear anywhere
+                        # in the UI (home tab, stats page, Prometheus).
+                        #
+                        # During the grace window after a pool switch, the pool
+                        # may reject shares because VarDiff hasn't ramped yet.
+                        # These are not real errors -- the miner did valid work
+                        # at the old difficulty.  Convert them to fake accepts.
+                        #
+                        # IMPORTANT: check the grace window against the SUBMIT time
+                        # (_submit_ts), not the response time.  The pool may take
+                        # 1-2 seconds to respond, so shares submitted within the
+                        # grace window can get rejected responses after it ends.
+                        _suppressed_vardiff = False
+
+                        # Switch grace window: suppress stale/job-not-found rejects
+                        # for _SWITCH_GRACE_S seconds after any pool switch.
+                        # Miner hardware pipelines hold many in-flight shares built
+                        # on the prior pool's work -- these arrive immediately after
+                        # the switch and would otherwise cause ckpool to ban the miner
+                        # for a burst of unavoidable stale share submissions.
+                        # This suppression is independent of the VarDiff path and
+                        # fires even after the first accept on the new pool.
+                        if (self._switch_grace_end > 0
+                                and time.monotonic() < self._switch_grace_end):
+                            _err = msg.get("error")
+                            _err_str = (
+                                _err[1].lower() if isinstance(_err, list) and len(_err) >= 2 and isinstance(_err[1], str)
+                                else _err.get("message", "").lower() if isinstance(_err, dict)
+                                else _err.lower() if isinstance(_err, str)
+                                else ""
+                            )
+                            _is_stale = bool(_err_str and (
+                                "stale" in _err_str
+                                or "job not found" in _err_str
+                                or "duplicate" in _err_str
+                            ))
+                            if _is_stale:
+                                _suppressed_vardiff = True
+                                _vd_count = getattr(self, "_vardiff_suppressed", 0)
+                                self._vardiff_suppressed = _vd_count + 1
+                                if _vd_count == 0 or _vd_count % 10 == 0:
+                                    log("reject_suppressed_switch_grace",
+                                        sid=self.sid, pool=p,
+                                        grace_remaining_s=round(self._switch_grace_end - time.monotonic(), 1),
+                                        error=str(_err)[:100],
+                                        suppressed_count=_vd_count + 1,
+                                        worker=self.worker or "unknown")
+                                await write_line(self.miner_w, dumps_json({
+                                    "id": msg.get("id"),
+                                    "result": True,
+                                    "error": None
+                                }), "downstream")
+                                continue
+
+                        _submit_switch_mono = self.submit_switch_mono.pop(mid, None)
+                        if _submit_switch_mono is not None and self._post_switch_accepts == 0:
+                            _switch_age_at_submit = _submit_ts - _submit_switch_mono
+                            if _switch_age_at_submit >= 0:
+                                _err = msg.get("error")
+
+                                # Detect null-error or low-difficulty rejects
+                                # Normalize plain string errors for uniform matching
+                                _err_str = (
+                                    _err[1].lower() if isinstance(_err, list) and len(_err) >= 2 and isinstance(_err[1], str)
+                                    else _err.get("message", "").lower() if isinstance(_err, dict)
+                                    else _err.lower() if isinstance(_err, str)
+                                    else ""
+                                )
+                                _is_suppressible = (
+                                    _err is None
+                                    or (isinstance(_err, list) and len(_err) >= 2
+                                        and _err[1] is None)
+                                    or (isinstance(_err, dict)
+                                        and _err.get("message") is None)
+                                    or bool(_err_str and (
+                                        "null" in _err_str
+                                        or "difficulty" in _err_str
+                                        or "stale" in _err_str
+                                        or "job not found" in _err_str
+                                        or "unauthorized" in _err_str
+                                        or "duplicate" in _err_str
+                                        or "above target" in _err_str
+                                        or "high hash" in _err_str
+                                        or "low hash" in _err_str))
+                                )
+                                if _is_suppressible:
+                                    _suppressed_vardiff = True
+                                    _vd_count = getattr(self, "_vardiff_suppressed", 0)
+                                    self._vardiff_suppressed = _vd_count + 1
+                                    if _vd_count == 0 or _vd_count % 20 == 0:
+                                        log("reject_suppressed_vardiff",
+                                            sid=self.sid, pool=p,
+                                            switch_age_at_submit_s=round(_switch_age_at_submit, 2),
+                                            error=str(_err)[:100],
+                                            suppressed_count=_vd_count + 1,
+                                            worker=self.worker or "unknown")
+                                    # Send fake accept to miner
+                                    await write_line(self.miner_w, dumps_json({
+                                        "id": msg.get("id"),
+                                        "result": True,
+                                        "error": None
+                                    }), "downstream")
+                                    # Still count toward auto-pin detection even though
+                                    # we're suppressing the reject from the miner.
+                                    # BUT skip counting during the grace period after a
+                                    # switch -- miners need time to flush old work.
+                                    _switch_age = (time.monotonic() - self.last_switch_mono
+                                                   if self.last_switch_mono else 999.0)
+                                    if (self.last_switch_mono is not None
+                                            and p == self.active_pool
+                                            and _switch_age >= self._pin_grace_period_s):
+                                        self._post_switch_rejects += 1
+                                        if _is_extranonce_mismatch_reject(_err):
+                                            self._post_switch_en1_mismatch += 1
+                                        # Early detection: 3+ near-zero rejects (may span sessions)
+                                        # is conclusive evidence of extranonce1 mismatch.
+                                        if (self._post_switch_en1_mismatch >= 3
+                                                and self._post_switch_accepts == 0):
+                                            try:
+                                                _peer2 = self.miner_w.get_extra_info("peername")
+                                                if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                    await _handle_switch_failure(
+                                                        self, _peer2[0],
+                                                        "extranonce1_mismatch",
+                                                        "3+ near-zero rejects across sessions (via vardiff suppress)")
+                                            except Exception:
+                                                pass
+                                        elif (self._post_switch_rejects >= 10
+                                                and self._post_switch_accepts == 0):
+
+                                            _en2a = self.extranonce2_size.get("A")
+                                            _en2b = self.extranonce2_size.get("B")
+                                            _en1_mismatch = self._post_switch_en1_mismatch >= 5
+                                            if _en1_mismatch:
+                                                try:
+                                                    _peer2 = self.miner_w.get_extra_info("peername")
+                                                    if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                        await _handle_switch_failure(
+                                                            self, _peer2[0],
+                                                            "extranonce1_mismatch",
+                                                            "10+ rejects with 0 accepts after switch (via vardiff suppress)")
+                                                except Exception:
+                                                    pass
+                                            else:
+                                                if self._post_switch_rejects == 10:
+                                                    log("auto_pin_skipped", sid=self.sid,
+                                                        worker=self.worker or "unknown",
+                                                        rejects=self._post_switch_rejects,
+                                                        en1_mismatch_count=self._post_switch_en1_mismatch,
+                                                        en2a=_en2a, en2b=_en2b,
+                                                        reason="no extranonce1 mismatch detected")
+
+
+                                                # Fallback: if miner has 30+ rejects with 0 accepts
+                                                # and has been on this pool for 30+ seconds, pin it.
+                                                # Catches miners that can't work on a pool for reasons
+                                                # other than extranonce mismatch (e.g. firmware limits).
+                                                elif (self._post_switch_rejects >= 30
+                                                        and _switch_age >= 30.0):
+                                                    try:
+                                                        _peer2 = self.miner_w.get_extra_info("peername")
+                                                        if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                            await _handle_switch_failure(
+                                                                self, _peer2[0],
+                                                                "no_accepts_after_switch",
+                                                                "30+ rejects with 0 accepts after 30s on new pool")
+                                                    except Exception:
+                                                        pass
+
+                                    continue
+
+                        # Reset vardiff suppression counter outside grace window
+                        if not _suppressed_vardiff:
+                            _prev_vd = getattr(self, "_vardiff_suppressed", 0)
+                            if _prev_vd > 0:
+                                log("reject_suppressed_vardiff_end",
+                                    sid=self.sid, pool=p,
+                                    total_suppressed=_prev_vd,
+                                    worker=self.worker or "unknown")
+                                self._vardiff_suppressed = 0
+
+                        # VarDiff ramp suppression: if we're seeing consecutive
+                        # null-error rejects on a pool (Bassin raised its bar
+                        # internally before sending mining.set_difficulty), swallow
+                        # them after 3+ consecutive to avoid inflating reject counts.
+                        _err = msg.get("error")
+                        _is_null_reject = (
+                            _err is None
+                            or (isinstance(_err, list) and len(_err) >= 2
+                                and _err[1] is None)
+                            or (isinstance(_err, dict)
+                                and _err.get("message") is None)
+                        )
+                        if _is_null_reject and p == self.active_pool:
+                            self._vardiff_ramp_consec_rejects += 1
+                            self._vardiff_ramp_pool = p
+                            if self._vardiff_ramp_consec_rejects >= 3:
+                                self._vardiff_ramp_suppressed += 1
+                                if self._vardiff_ramp_suppressed == 1 or self._vardiff_ramp_suppressed % 20 == 0:
+                                    log("vardiff_ramp_suppress", sid=self.sid, pool=p,
+                                        consec_rejects=self._vardiff_ramp_consec_rejects,
+                                        suppressed_count=self._vardiff_ramp_suppressed,
+                                        worker=self.worker or "unknown")
+                                await write_line(self.miner_w, dumps_json({
+                                    "id": msg.get("id"),
+                                    "result": True,
+                                    "error": None
+                                }), "downstream")
+                                # Still count toward auto-pin detection even though
+                                # we're suppressing the reject from the miner.
+                                # BUT skip counting during the grace period after a
+                                # switch -- miners need time to flush old work.
+                                _switch_age2 = (time.monotonic() - self.last_switch_mono
+                                                if self.last_switch_mono else 999.0)
+                                if (self.last_switch_mono is not None
+                                        and p == self.active_pool
+                                        and _switch_age2 >= self._pin_grace_period_s):
+                                    self._post_switch_rejects += 1
+                                    if _is_extranonce_mismatch_reject(_err):
+                                        self._post_switch_en1_mismatch += 1
+                                    # Early detection: 3+ near-zero rejects (may span sessions)
+                                    if (self._post_switch_en1_mismatch >= 3
+                                            and self._post_switch_accepts == 0):
+                                        try:
+                                            _peer2 = self.miner_w.get_extra_info("peername")
+                                            if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                await _handle_switch_failure(
+                                                    self, _peer2[0],
+                                                    "extranonce1_mismatch",
+                                                    "3+ near-zero rejects across sessions (via ramp suppress)")
+                                        except Exception:
+                                            pass
+                                    elif (self._post_switch_rejects >= 10
+                                            and self._post_switch_accepts == 0):
+                                        _en2a = self.extranonce2_size.get("A")
+                                        _en2b = self.extranonce2_size.get("B")
+                                        _en2_mismatch = (_en2a is not None and _en2b is not None
+                                                         and _en2a != _en2b)
+                                        _en1_mismatch = self._post_switch_en1_mismatch >= 5
+                                        if _en2_mismatch or _en1_mismatch:
+                                            try:
+                                                _peer2 = self.miner_w.get_extra_info("peername")
+                                                if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                    _pin_reason = ("en2_size_mismatch" if _en2_mismatch
+                                                                   else "extranonce1_mismatch")
+                                                    await _handle_switch_failure(
+                                                        self, _peer2[0],
+                                                        _pin_reason,
+                                                        "10+ rejects with 0 accepts after switch (via ramp suppress)")
+                                            except Exception:
+                                                pass
+                                        else:
+                                            if self._post_switch_rejects == 10:
+                                                log("auto_pin_skipped_same_en2", sid=self.sid,
+                                                    worker=self.worker or "unknown",
+                                                    rejects=self._post_switch_rejects,
+                                                    en1_mismatch_count=self._post_switch_en1_mismatch,
+                                                    en2a=_en2a, en2b=_en2b,
+                                                    reason="en2 sizes match and no extranonce1 mismatch detected")
+                                continue
+
+                        # Only count as a real reject if NOT suppressed
+                        SHARES_REJECTED.labels(pool=p).inc()
+                        log("share_result", sid=self.sid, pool=p, accepted=False, error=msg.get("error"))
+
+                        # Post-switch reject tracking (for auto-pin detection).
+                        # If a miner gets 10+ rejects with zero accepts after a switch,
+                        # AND the en2 sizes differ between pools, pin it.
+                        # BUT skip counting during the grace period after a
+                        # switch -- miners need time to flush old work.
+                        _switch_age3 = (time.monotonic() - self.last_switch_mono
+                                        if self.last_switch_mono else 999.0)
+                        if (self.last_switch_mono is not None
+                                and p == self.active_pool
+                                and _switch_age3 >= self._pin_grace_period_s):
+                            self._post_switch_rejects += 1
+                            _err_raw = msg.get("error")
+                            if _is_extranonce_mismatch_reject(_err_raw):
+                                self._post_switch_en1_mismatch += 1
+                            # Early detection: 3+ near-zero rejects (may span sessions)
+                            if (self._post_switch_en1_mismatch >= 3
+                                    and self._post_switch_accepts == 0):
+                                try:
+                                    _peer = self.miner_w.get_extra_info("peername")
+                                    if _peer and not dpmp_fleet.en2_is_pinned(_peer[0]):
+                                        await _handle_switch_failure(
+                                            self, _peer[0],
+                                            "extranonce1_mismatch",
+                                            "3+ near-zero rejects across sessions")
+                                except Exception:
+                                    pass
+                            elif (self._post_switch_rejects >= 10
+                                    and self._post_switch_accepts == 0):
+                                _en2a = self.extranonce2_size.get("A")
+                                _en2b = self.extranonce2_size.get("B")
+                                _en2_mismatch = (_en2a is not None and _en2b is not None
+                                                 and _en2a != _en2b)
+                                _en1_mismatch = self._post_switch_en1_mismatch >= 5
+                                if _en2_mismatch or _en1_mismatch:
+                                    try:
+                                        _peer = self.miner_w.get_extra_info("peername")
+                                        if _peer and not dpmp_fleet.en2_is_pinned(_peer[0]):
+                                            _pin_reason = ("en2_size_mismatch" if _en2_mismatch
+                                                           else "extranonce1_mismatch")
+                                            await _handle_switch_failure(
+                                                self, _peer[0],
+                                                _pin_reason,
+                                                "10+ rejects with 0 accepts after switch")
+                                    except Exception:
+                                        pass
+                                else:
+                                    if self._post_switch_rejects == 10:
+                                        log("auto_pin_skipped_same_en2", sid=self.sid,
+                                            worker=self.worker or "unknown",
+                                            rejects=self._post_switch_rejects,
+                                            en1_mismatch_count=self._post_switch_en1_mismatch,
+                                            en2a=_en2a, en2b=_en2b,
+                                            reason="en2 sizes match and no extranonce1 mismatch detected")
+
+                        # --- Health: post-switch reject tracking (Phase 1b) ---
+                        # Only count rejects for shares SUBMITTED within 4s of a switch.
+                        # Use _submit_ts (when the share was sent) not response time.
+                        try:
+                            wn = self.worker or "unknown"
+                            if self.last_switch_mono is not None and _submit_ts > 0:
+                                _health_switch_age = _submit_ts - self.last_switch_mono
+                                if 0 <= _health_switch_age < dpmp_fleet.miner_grace_window_s(
+                                        dpmp_fleet.fleet_state.get("miners", {}).get(
+                                            str(self.sid), {}).get("hashrate_ths", 5.0)):
+                                    self._health_post_switch_rejects += 1
+                                    # Cancel pending clean switch credit
+                                    self._health_clean_switch_pending = None
+
+                                    # Reject storm: >5 rejects within grace window
+                                    if (self._health_post_switch_rejects > 5
+                                            and not self._health_post_switch_storm_fired):
+                                        self._health_post_switch_storm_fired = True
+                                        dpmp_fleet.health_event(wn, 0.0, "reject_storm")
+                                        # Record SR recruit cooldown for this worker.
+                                        # If it was SR-recruited, it won't be recruited
+                                        # again for an exponentially increasing cooldown
+                                        # period (30min base, doubling on each repeat).
+                                        dpmp_fleet.sr_recruit_record_cooldown(wn)
+
+                                    # Null-error reject (VarDiff ramp issue)
+                                    # Skip health penalty if the share was submitted
+                                    # very early after connect/switch -- these are
+                                    # expected startup artifacts from in-flight shares
+                                    # that were submitted before the pool sent new work.
+                                    _err = msg.get("error")
+                                    _is_null_err = (
+                                        _err is None
+                                        or (isinstance(_err, list) and len(_err) >= 2
+                                            and _err[1] is None)
+                                        or (isinstance(_err, list) and len(_err) >= 2
+                                            and isinstance(_err[1], str)
+                                            and "null" in _err[1].lower())
+                                    )
+                                    if _is_null_err:
+                                        # Suppress health penalty if share was submitted
+                                        # within 10s of last switch (in-flight startup
+                                        # shares arrive after suppression window closes).
+                                        _null_submit_age = (
+                                            _submit_ts - self.last_switch_mono
+                                            if self.last_switch_mono and _submit_ts > 0
+                                            else 999.0
+                                        )
+                                        log("null_error_reject_diag",
+                                            sid=self.sid, worker=wn,
+                                            submit_age_s=round(_null_submit_age, 2),
+                                            health_switch_age_s=round(_health_switch_age, 2),
+                                            submit_ts=round(_submit_ts, 3),
+                                            last_switch_mono=round(self.last_switch_mono, 3) if self.last_switch_mono else None,
+                                            grace_window_s=round(dpmp_fleet.miner_grace_window_s(
+                                                dpmp_fleet.fleet_state.get("miners", {}).get(
+                                                    str(self.sid), {}).get("hashrate_ths", 5.0)), 2))
+                                        if _null_submit_age > 10.0:
+                                            dpmp_fleet.health_event(wn, 0.0, "null_error_reject")
+                                        else:
+                                            log("null_error_reject_suppressed_startup",
+                                                sid=self.sid, worker=wn,
+                                                submit_age_s=round(_null_submit_age, 2))
+
+                        except Exception:
+                            pass
+
+                        # --- Stats tab: per-worker rejected share tracking ---
+                        try:
+                            wn = self.worker or "unknown"
+                            dpmp_fleet.worker_record_share(wn, d, False, pool_key=p)
+                        except Exception:
+                            pass
+                        # Auto-detect miners that can't handle en2_size changes:
+                        # if a reject arrives shortly after an en2_size hint was
+                        # written, this miner likely can't handle the change.
+                        try:
+                            _peer = self.miner_w.get_extra_info("peername")
+                            if _peer and dpmp_fleet.has_recent_en2_hint(_peer[0]):
+                                crossed = dpmp_fleet.record_en2_strike(_peer[0])
+                                if crossed:
+                                    log("en2_force_disconnect_learned", sid=self.sid,
+                                        miner_ip=_peer[0],
+                                        reason="miner rejected shares after en2_size changes, will pin to current pool")
+                                    # --- Health: en2 mismatch penalty (Phase 1b) ---
+                                    try:
+                                        _wn = self.worker or "unknown"
+                                        dpmp_fleet.health_event(_wn, 0.0, "en2_force_disconnect")
+                                    except Exception:
+                                        pass
+                                else:
+                                    log("en2_strike_recorded", sid=self.sid,
+                                        miner_ip=_peer[0],
+                                        strikes=dpmp_fleet.en2_strikes.get(_peer[0], 0))
+                        except Exception:
+                            pass
+                await write_line(self.miner_w, dumps_json(msg), "downstream")
+                continue
+
+            # Forward setup methods from the handshake pool only (but never notify/diff)
+            primary = self.handshake_pool or "A"
+            if pool_key == primary and method is not None:
+                await write_line(self.miner_w, raw, "downstream")
+
+    # Pool Failover: clear stale state for a dead pool
+    def clear_pool_state(self, pool_key: str):
+        """Wipe cached data for a pool that just disconnected.
+
+        Why each field is cleared:
+        - latest_notify_raw / latest_jobid: The old job belongs to a now-dead
+          TCP session.  If the scheduler forwarded it, the miner would submit
+          shares that the pool can never accept (session is gone).
+        - latest_diff: The difficulty was for the old session; the pool will
+          send a new one after reconnect.
+        - extranonce1 / extranonce2_size: Same session-scoped values that
+          become invalid when the TCP connection drops.
+        - pool_w entry: The old writer is broken; remove it so send_upstream()
+          queues messages instead of writing to a dead socket.
+        - CONN_UPSTREAM gauge: Decrement so Prometheus reflects reality.
+        - raw_subscribe_forwarded_pool: Must be cleared so that after reconnect,
+          maybe_send_downstream_extranonce() is NOT blocked by the stale
+          "already sent via raw subscribe" guard.  Without this, the miner
+          never receives the new pool's extranonce and every share is rejected
+          as "low difficulty".
+        """
+        self.latest_notify_raw[pool_key] = None
+        self.latest_jobid[pool_key] = None
+        self.latest_diff[pool_key] = None
+
+        self.extranonce1[pool_key] = None
+        self.extranonce2_size[pool_key] = None
+
+        # Clear "last sent" tracking so reconnect WILL send the new extranonce 
+        # Without this, the bootstrap response updates extranonce1[pool_key] and
+        # maybe_send_downstream_extranonce() sees new==last and skips sending.
+        if getattr(self, "last_downstream_extranonce_pool", None) == pool_key:
+            self.last_downstream_en1 = None
+            self.last_downstream_en2s = None
+            self.last_downstream_extranonce_pool = None
+            log("clear_pool_state_reset_last_downstream_extranonce", sid=self.sid, pool=pool_key)
+
+        # NEW: clear the raw-subscribe guard so reconnect can send extranonce 
+        if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+            self.raw_subscribe_forwarded_pool = None
+            log("clear_pool_state_reset_raw_subscribe_flag", sid=self.sid, pool=pool_key)
+
+        # Remove the dead writer so send_upstream() will queue, not crash.
+        old_w = self.pool_w.pop(pool_key, None)
+        if old_w is not None:
+            try:
+                old_w.close()
+            except Exception:
+                pass
+
+        # Clear the reader/writer instance attributes too.
+        if pool_key == "A":
+            self.rA = None
+            self.wA = None
+        else:
+            self.rB = None
+            self.wB = None
+
+        CONN_UPSTREAM.labels(pool=pool_key).dec()
+        log("pool_state_cleared", sid=self.sid, pool=pool_key)
+
+
+    # Periodic state pruning 
+    # Several dicts/sets grow with every job or upstream response but
+    # are never trimmed.  Over weeks of runtime this leaks memory.
+    # This method is called every ~60 seconds from forward_jobs().
+    def prune_stale_state(self):
+        """Remove entries older than 5 minutes from structures that grow unbounded."""
+        now = time.monotonic()
+        max_age = 300.0  # 5 minutes -- no job/response older than this is useful
+
+        # 1) job_owner: keyed by (pool_key, jobid).
+        #    Keep only the last ~200 entries.  Jobs older than that are
+        #    long expired; no miner will submit against them.
+        max_jobs = 200
+        if len(self.job_owner) > max_jobs:
+            # We can't age these (no timestamp), so just keep the most recent N.
+            # Since Python 3.7+ dicts preserve insertion order, drop from the front.
+            excess = len(self.job_owner) - max_jobs
+            keys_to_drop = list(self.job_owner.keys())[:excess]
+            for k in keys_to_drop:
+                del self.job_owner[k]
+
+            log("prune_job_owner", sid=self.sid, dropped=excess,
+                remaining=len(self.job_owner))
+            # Also prune expired grace window entries
+            now_prune = time.monotonic()
+            expired_grace = [k for k, v in self.job_valid_until.items() if v < now_prune]
+            for k in expired_grace:
+                self.job_valid_until.pop(k, None)
+
+        # 2) seen_upstream_response_ids: grows with every upstream response.
+        #    These are (pool_key, msg_id) tuples used to de-dupe.
+        #    After a few minutes, no duplicate will arrive.  Cap at 500.
+        max_seen = 500
+        if len(self.seen_upstream_response_ids) > max_seen:
+            # set() has no insertion order, so just clear and start fresh.
+            # The worst that can happen is a duplicate response gets forwarded
+            # once -- harmless, the miner ignores unexpected responses.
+            excess = len(self.seen_upstream_response_ids)
+            self.seen_upstream_response_ids.clear()
+            log("prune_seen_upstream_ids", sid=self.sid, cleared=excess)
+
+        # 3) _internal_ids: bootstrap request IDs.  Grows on each reconnect.
+        #    Only a handful are "active" at any time.  Keep only the last 50.
+        max_internal = 50
+        if len(self._internal_ids) > max_internal:
+            # These are ints; keep the highest (most recent) N.
+            sorted_ids = sorted(self._internal_ids)
+            to_remove = sorted_ids[:len(sorted_ids) - max_internal]
+            for i in to_remove:
+                self._internal_ids.discard(i)
+            log("prune_internal_ids", sid=self.sid, dropped=len(to_remove),
+                remaining=len(self._internal_ids))
+
+        # 4) submit_owner / submit_diff: keyed by message id.
+        #    Normally pop'd when the pool responds, but orphaned entries
+        #    can accumulate if a pool never responds.  Cap at 200.
+        max_submit = 200
+        if len(self.submit_owner) > max_submit:
+            excess = len(self.submit_owner) - max_submit
+            keys_to_drop = list(self.submit_owner.keys())[:excess]
+            for k in keys_to_drop:
+                self.submit_owner.pop(k, None)
+                self.submit_diff.pop(k, None)
+                self.submit_mono.pop(k, None)
+                self.submit_true_diff.pop(k, None)
+            log("prune_submit_owner", sid=self.sid, dropped=excess,
+                remaining=len(self.submit_owner))
+
+    # End periodic state pruning 
+
+
+    # Pool Failover: reconnecting wrapper around pool_reader 
+    async def pool_reader_with_reconnect(self, pool_key: str, reader: asyncio.StreamReader):
+        """Wrap pool_reader in a reconnect loop.
+
+        Normal flow:
+          1. pool_reader() runs, processing messages until EOF or error.
+          2. When pool_reader() returns (pool disconnected), we land here.
+          3. Mark the pool dead, clear stale state.
+          4. Sleep with exponential backoff (5s, 10s, 20s, 40s -- capped at 60s).
+          5. Try to reconnect (connect_pool).
+          6. If reconnect succeeds -- reset fail counter, loop back to step 1.
+          7. If reconnect fails -- increment fail counter, loop back to step 4.
+
+        This method runs forever (until the miner session itself ends),
+        so the asyncio.wait(FIRST_COMPLETED) in run() is no longer
+        triggered by a pool going down.
+        """
+        pcfg = self.cfg.poolA if pool_key == "A" else self.cfg.poolB
+
+        while True:
+            # Phase 1: read from pool until it disconnects 
+            try:
+                await self.pool_reader(pool_key, reader)
+            except asyncio.CancelledError:
+                # Session is shutting down -- don't reconnect, just exit.
+                raise
+            except Exception as e:
+                log("pool_reader_error", sid=self.sid, pool=pool_key, err=str(e))
+
+            # If we get here, pool_reader returned (EOF) or raised.
+            # That means the pool's TCP connection is dead.
+
+            # Phase 2: mark dead + clear stale state 
+            self.pool_alive[pool_key] = False
+            self.pool_last_fail_mono[pool_key] = time.monotonic()
+            self.clear_pool_state(pool_key)
+
+            # Check if this is a pool-initiated idle disconnect on the
+            # inactive pool. Only treat it as an idle disconnect if the pool
+            # is configured with idle_disconnect=True (e.g. MiningCore which
+            # drops idle connections after ~10 minutes). For pools that don't
+            # have a timeout (e.g. Bassin, PublicPool), reconnect immediately
+            # as normal so we don't leave the connection silently dropped.
+            _pool_cfg = self.cfg.poolA if pool_key == "A" else self.cfg.poolB
+            _is_idle_disconnect = (pool_key != self.active_pool
+                                   and _pool_cfg.idle_disconnect)
+            if _is_idle_disconnect:
+                self.pool_idle_disconnected[pool_key] = True
+                log("pool_idle_disconnect", sid=self.sid, pool=pool_key,
+                    active_pool=self.active_pool,
+                    worker=self.worker or "unknown")
+                # Wait here until on-demand reconnect is requested.
+                # forward_jobs() will clear pool_idle_disconnected and
+                # call connect_pool() when a switch to this pool is needed.
+                while self.pool_idle_disconnected.get(pool_key, False):
+                    try:
+                        await asyncio.sleep(1.0)
+                    except asyncio.CancelledError:
+                        raise
+                # On-demand reconnect was requested -- fall through to
+                # Phase 3 to connect and bootstrap.
+                log("pool_idle_reconnect_requested", sid=self.sid, pool=pool_key,
+                    worker=self.worker or "unknown")
+            else:
+                log("pool_down", sid=self.sid, pool=pool_key,
+                    fail_count=self.pool_fail_count[pool_key],
+                    other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
+
+            # Phase 3: reconnect loop with backoff
+            # For on-demand reconnects (idle disconnect path), skip the initial
+            # delay so the switch can proceed as quickly as possible.
+            _first_attempt = True
+            while True:
+                # Exponential backoff: 5, 10, 20, 40, 60, 60, 60
+                # Skip delay on first attempt for on-demand reconnects.
+                base_delay = 5.0
+                max_delay = 60.0
+                delay = min(base_delay * (2 ** self.pool_fail_count[pool_key]), max_delay)
+                if _first_attempt and _is_idle_disconnect:
+                    delay = 0.0  # no delay for on-demand reconnects
+                _first_attempt = False
+                log("pool_reconnect_wait", sid=self.sid, pool=pool_key,
+                    delay_s=round(delay, 1),
+                    fail_count=self.pool_fail_count[pool_key])
+
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise
+
+                # Attempt reconnect
+                try:
+                    r, w = await asyncio.wait_for(
+                        self.connect_pool(pcfg, is_reconnect=True),
+                        timeout=15.0  # don't hang forever on a dead host 
+                   )
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.pool_fail_count[pool_key] += 1
+                    self.pool_last_fail_mono[pool_key] = time.monotonic()
+                    log("pool_reconnect_failed", sid=self.sid, pool=pool_key,
+                        err=str(e), fail_count=self.pool_fail_count[pool_key])
+                    continue  # back to top of reconnect loop (sleep again)
+
+                # Phase 4: reconnect succeeded! 
+                self.pool_alive[pool_key] = True
+                self.pool_fail_count[pool_key] = 0
+                self.pool_last_fail_mono[pool_key] = None
+
+                # Update reader/writer instance attributes.
+                if pool_key == "A":
+                    self.rA = r
+                    self.wA = w
+                else:
+                    self.rB = r
+                    self.wB = w
+
+                reader = r  # use the new reader for the next pool_reader() call
+                log("pool_reconnected", sid=self.sid, pool=pool_key,
+                    other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
+
+                # Force miner to re-handshake after pool reconnect 
+                # When a pool reconnects, it issues a NEW extranonce1.
+                # The miner must pick up this new extranonce or every share
+                # will be rejected ("low difficulty share").
+                #
+                # We can't rely on mining.set_extranonce (NerdAxe, Nano3S,
+                # AvalonQ don't support it) or client.reconnect (NerdAxe/
+                # NerdMiner don't support it either).
+                #
+                # The most universally compatible approach: close the miner's
+                # TCP connection.  Every miner handles a dropped connection
+                # by reconnecting and doing a fresh subscribe handshake,
+                # which picks up the new extranonce naturally.
+                #
+                # EXCEPTION: pinned miners that are NOT on the reconnecting
+                # pool do not need to re-handshake -- they never use that
+                # pool's extranonce, so forcing a disconnect just causes
+                # unnecessary reject cycles (e.g. Gekko on Pool A when
+                # Pool B reconnects).
+                _peer_dc = self.miner_w.get_extra_info("peername")
+                _miner_ip_dc = _peer_dc[0] if _peer_dc else None
+                _is_pinned = _miner_ip_dc and dpmp_fleet.en2_is_pinned(_miner_ip_dc)
+
+                if _is_pinned and pool_key != self.active_pool:
+                    log("miner_disconnect_skipped_pinned", sid=self.sid,
+                        pool=pool_key, active_pool=self.active_pool,
+                        miner_ip=_miner_ip_dc,
+                        reason="pinned_miner_not_on_reconnecting_pool")
+                elif pool_key != self.active_pool:
+                    # On-demand reconnect for idle-disconnected pool --
+                    # miner is currently mining on the other pool and has
+                    # not been disturbed. Don't disconnect it here; the
+                    # extranonce will be sent when the switch executes.
+                    log("miner_disconnect_skipped_ondemand", sid=self.sid,
+                        pool=pool_key, active_pool=self.active_pool,
+                        reason="idle_reconnect_miner_unaffected")
+                else:
+                    try:
+                        log("miner_disconnect_for_reconnect", sid=self.sid,
+                            pool=pool_key,
+                            reason="pool_reconnected_new_extranonce",
+                            pinned=bool(_is_pinned))
+                        self.miner_w.close()
+                        await self.miner_w.wait_closed()
+                    except Exception as e:
+                        log("miner_disconnect_for_reconnect_failed",
+                            sid=self.sid, pool=pool_key, err=str(e))
+
+                break  # exit reconnect loop -- back to Phase 1 (pool_reader)
+
+    # Scheduler: forward jobs to miner based on v3 global assignments
+    async def forward_jobs(self):
+        await self.miner_ready.wait()
+        last_seen = {"A": 0, "B": 0}
+
+        current_pool = self.active_pool
+        # Safety: always start forwarding on the handshake pool.
+        # The miner's extranonce context from the subscribe response belongs to
+        # handshake_pool. If active_pool (from round-robin) differs, forwarding
+        # Pool B jobs immediately would send Pool B's extranonce mid-session,
+        # invalidating Pool A's subscribe extranonce and causing mass rejects.
+        # The assigner will move the miner to the correct pool after grace period.
+        if self.handshake_pool and current_pool != self.handshake_pool:
+            log("startup_pool_corrected_to_handshake", sid=self.sid,
+                was=current_pool, corrected=self.handshake_pool)
+            current_pool = self.handshake_pool
+            self.active_pool = self.handshake_pool
+
+        ACTIVE_POOL.labels(pool="A").set(1 if current_pool == "A" else 0)
+        ACTIVE_POOL.labels(pool="B").set(1 if current_pool == "B" else 0)
+        last_switch_ts = time.monotonic()
+        _startup_grace_mono = time.monotonic()
+
+        # Register this miner in the global fleet tracker
+        # fleet_register returns the actual stored switch_count, which
+        # may include carried-over switches from a previous session
+        # (miner reconnected).
+        self.switch_count = dpmp_fleet.fleet_register(str(self.sid), current_pool,
+                        worker_name=self.worker or "unknown",
+                        switch_count=0,
+                        last_switch_mono=time.monotonic())
+
+        # The en1 mismatch carry is no longer needed -- the 5-second grace
+        # period after each switch gives miners time to produce accepted
+        # shares before rejects are counted.  Starting fresh each session
+        # prevents false pin accumulation across sessions.
+        # (Was: self._post_switch_en1_mismatch = dpmp_fleet.en1_mismatch_carry_restore(...))
+        _carried = dpmp_fleet.en1_mismatch_carry_restore(self.worker or "unknown")
+        if _carried > 0:
+            log("en1_mismatch_carry_discarded", sid=self.sid,
+                worker=self.worker or "unknown", carried=_carried,
+                reason="grace period makes carry unnecessary")
+
+        log("scheduler_init", sid=self.sid, pool=current_pool,
+            worker=self.worker or "unknown", scheduler="v3")
+
+        last_sent_seq = {"A": 0, "B": 0}
+        last_prune_mono = time.monotonic()
+        _last_tick_mono = time.monotonic()
+
+        while True:
+            # Periodic cleanup (every 60s) 
+            if time.monotonic() - last_prune_mono >= 60.0:
+                self.prune_stale_state()
+                last_prune_mono = time.monotonic()
+            now = time.monotonic()
+            switched_this_tick = False  # force-forward cached notify immediately after a switch
+
+            # --- Time-weighted ratio recording (every tick) ---
+            # Record how much hashrate-time this miner contributed to its
+            # current pool.  This feeds dpmp_fleet.get_actual_ratio() for a stable
+            # ratio display that doesn't swing with share bursts.
+            _dt = min(now - _last_tick_mono, 2.0)  # cap to avoid spikes
+            _last_tick_mono = now
+            _my_hr = dpmp_fleet.fleet_state.get("miners", {}).get(
+                str(self.sid), {}).get("hashrate_ths", 0.0)
+            # Fallback: if hashrate is unknown (0.0), use 1.0 so all miners
+            # contribute equally to the ratio until real hashrate data arrives.
+            # Without this, the ratio window stays empty on startup until
+            # share_log has enough entries for hashrate estimation, causing
+            # gauges to peg when the first miner's estimate arrives.
+            if _my_hr <= 0.0:
+                _my_hr = 1.0
+            dpmp_fleet.time_ratio_record(current_pool, _my_hr, _dt, sid_str=str(self.sid))
+
+            # Failover: emergency switch if current pool is dead 
+            # If the pool we're currently forwarding from just died, don't
+            # wait for the normal scheduler cycle -- switch immediately
+            # to the other pool if it's alive.  Without this, the miner would
+            # sit idle (no new jobs) until the next scheduler tick.
+            if not self.pool_alive.get(current_pool, False):
+                other = "B" if current_pool == "A" else "A"
+                if self.pool_alive.get(other, False) and self.latest_notify_raw.get(other) is not None:
+                    log("failover_emergency_switch", sid=self.sid,
+                        dead_pool=current_pool, switching_to=other)
+                    self.active_pool = other
+                    ACTIVE_POOL.labels(pool="A").set(1 if other == "A" else 0)
+                    ACTIVE_POOL.labels(pool="B").set(1 if other == "B" else 0)
+                    current_pool = other
+                    last_switch_ts = now
+                    self.last_switch_mono = now
+                    self.switch_count += 1
+                    switched_this_tick = True
+                    dpmp_fleet.fleet_register(str(self.sid), other,
+                                    worker_name=self.worker or "unknown",
+                                    switch_count=self.switch_count,
+                                    last_switch_mono=now)
+                    await self.resend_active_notify_clean(other, reason="failover_emergency")
+                elif not self.pool_alive.get(other, False):
+                    # Both pools dead -- nothing to do, just wait.
+                    await asyncio.sleep(0.10)
+                    continue
+
+            # Normal scheduling logic (v3 per-session executor) 
+            # Read this miner's assignment from the global assigner table.
+            # The assigner runs every ~3 seconds and computes optimal fleet
+            # placement.  Each miner just executes its assignment.
+            # Use timeout to avoid blocking the event loop if the stats
+            # writer thread holds the lock during _fleet_state_build().
+            if dpmp_fleet.assignments_lock.acquire(timeout=0.2):
+                try:
+                    _my_assignment = dpmp_fleet.assignments.get(str(self.sid), {})
+                finally:
+                    dpmp_fleet.assignments_lock.release()
+            else:
+                _my_assignment = {}  # safe fallback: no assignment = hold current pool
+
+            # --- Rolling ratio window gauge (v3 Phase 1a) ---
+            _rw_a, _rw_b = dpmp_fleet.get_actual_ratio()
+            RATIO_WINDOW.labels(pool="A").set(round(_rw_a, 6))
+            RATIO_WINDOW.labels(pool="B").set(round(_rw_b, 6))
+
+            # --- Prometheus: keep SCHEDULER_SHARE updated from rolling window ---
+            # In v2 this came from decay counters; in v3 the rolling window IS
+            # the ratio measurement, so we just mirror it here.
+            SCHEDULER_SHARE.labels(pool="A").set(round(_rw_a, 6))
+            SCHEDULER_SHARE.labels(pool="B").set(round(_rw_b, 6))
+
+            # --- Health: clean switch check + continuous mining credit (Phase 1b) ---
+            try:
+                _wn = self.worker or "unknown"
+                if _wn != "unknown":
+                    if (self._health_clean_switch_pending is not None
+                            and (now - self._health_clean_switch_pending) >= 10.0):
+                        dpmp_fleet.health_event(_wn, 1.0, "clean_switch")
+                        self._health_clean_switch_pending = None
+                    if (now - self._health_last_continuous_credit) >= 30.0:
+                        dpmp_fleet.health_event(_wn, 1.0, "continuous_mining")
+                        self._health_last_continuous_credit = now
+                        # Keep last_seen fresh so this miner doesn't vanish
+                        # from Fleet/Worker Stats during share droughts.
+                        if dpmp_fleet.worker_stats_lock.acquire(timeout=0.2):
+                            try:
+                                ws = dpmp_fleet.worker_stats.get(_wn)
+                                if ws:
+                                    ws["last_seen"] = time.time()
+                            finally:
+                                dpmp_fleet.worker_stats_lock.release()
+            except Exception as _health_err:
+                log("health_tick_error", sid=self.sid, err=str(_health_err))
+
+            # --- v3 per-session executor: decide whether to switch ---
+            _mode = _my_assignment.get("mode", "static")
+            pick = current_pool  # default: stay where we are
+
+            if _mode == "static":
+                # Static miner: only switch if the assigner reassigned us.
+                _target_pool = _my_assignment.get("pool", current_pool)
+                if _target_pool != current_pool:
+                    # Guard: don't switch in the first 20 seconds after startup.
+                    # Pool B bootstrap may still be completing, and switching
+                    # before it finishes causes a low-diff reject storm
+                    # (especially on high-hashrate miners like AvalonQ).
+                    if (now - _startup_grace_mono) < 10.0:
+                        pick = current_pool
+                        _sched_reason = "startup_grace_hold"
+                    elif dpmp_fleet.is_manual_mode_active():
+                        # In Manual mode, always use full disconnect/reconnect
+                        # to reach the target pool. This bypasses mid-session
+                        # extranonce changes entirely -- the miner reconnects
+                        # fresh and handshakes directly with the target pool.
+                        # Safe for all miners including en2-sensitive ones like Gekko.
+                        _peer_manual = self.miner_w.get_extra_info("peername")
+                        if _peer_manual:
+                            _last_force = getattr(self, "_last_en2_force_reconnect_mono", 0.0)
+                            if now - _last_force >= 30.0:
+                                try:
+                                    dpmp_fleet.en2_clear_pin(_peer_manual[0])                                    
+                                    dpmp_fleet.en2_set_hint(_peer_manual[0], _target_pool)
+                                    log("manual_mode_force_reconnect", sid=self.sid,
+                                        from_pool=current_pool, to_pool=_target_pool,
+                                        miner_ip=_peer_manual[0],
+                                        worker=self.worker or "unknown")
+                                    self._last_en2_force_reconnect_mono = now
+                                    self.miner_w.close()
+                                except Exception as e:
+                                    log("manual_mode_force_reconnect_error",
+                                        sid=self.sid, err=str(e))
+                        pick = current_pool  # hold until reconnect completes
+                        _sched_reason = "manual_mode_reconnect_pending"
+                    else:
+                        pick = _target_pool
+                        _sched_reason = "assigner_static_reassign"
+                else:
+                    _sched_reason = "static_hold"
+
+            elif _mode == "time_slice":
+                # Time-slicing miner: alternate between home_pool and slice_pool
+                # based on calculated durations from the assigner.
+                _home = _my_assignment.get("home_pool", current_pool)
+                _slice = _my_assignment.get("slice_pool",
+                                            "B" if current_pool == "A" else "A")
+                _home_dur = _my_assignment.get("home_duration_s", 30.0)
+                _slice_dur = _my_assignment.get("slice_duration_s", 10.0)
+
+                # Hold the slice timer until the first accepted share arrives,
+                # but only when force_reconnect_on_en2_mismatch is enabled.
+                # With force reconnect, each switch involves a full reconnect
+                # and VarDiff ramp-up, so the timer should not start until
+                # the miner is actually producing accepted shares.
+                # Without force reconnect, VarDiff context is preserved across
+                # in-session switches so no ramp-up delay is needed.
+                # Safety timeout: if no accept arrives within 120s, start the
+                # timer anyway to prevent the miner from being stuck forever.
+                if not self._slice_timer_started and self.cfg.sched.force_reconnect_on_en2_mismatch:
+                    if now - last_switch_ts >= 120.0:
+                        self._slice_timer_started = True
+                        log("slice_timer_forced", sid=self.sid,
+                            pool=current_pool, worker=self.worker or "unknown",
+                            reason="no_accept_within_120s")
+                    else:
+                        last_switch_ts = now
+                elif not self._slice_timer_started:
+                    self._slice_timer_started = True
+                _time_on_current = now - last_switch_ts
+
+                if current_pool == _home:
+                    if _time_on_current >= _home_dur:
+                        pick = _slice
+                        _sched_reason = "time_slice_to_minority"
+                    else:
+                        _sched_reason = "time_slice_home_hold"
+                else:
+                    # We're on the slice (minority) pool
+                    if _time_on_current >= _slice_dur:
+                        pick = _home
+                        _sched_reason = "time_slice_to_home"
+                    else:
+                        _sched_reason = "time_slice_minority_hold"
+
+            else:
+                # No assignment yet (assigner hasn't run) -- hold current
+                _sched_reason = "no_assignment"
+
+            # --- Failover overrides ---
+            # If the picked pool is dead, don't switch to it.
+            # If the current pool is dead, the emergency block above already
+            # handled it.  This just prevents the assigner from sending us
+            # to a dead pool.
+            if pick != current_pool and not self.pool_alive.get(pick, False):
+                if self.pool_idle_disconnected.get(pick, False):
+                    # Target pool is idle-disconnected (not truly dead) --
+                    # allow the switch attempt to proceed so the on-demand
+                    # reconnect trigger in the switch block can fire.
+                    pass
+                else:
+                    pick = current_pool
+                    _sched_reason = "target_pool_dead"
+
+            # --- Throttled scheduler_tick log ---
+            # Only log on actual switch decisions or every 60s as heartbeat.
+            # Failed switch attempts (cooldown blocked) are throttled separately
+            # to avoid spamming the log every 0.1s.
+            _now_mono = time.monotonic()
+            _last_tick_log = getattr(self, "_last_scheduler_tick_log", 0.0)
+            _should_log_tick = (
+                (pick != current_pool and (_now_mono - _last_tick_log) >= 3.0)
+                or (_now_mono - _last_tick_log) >= 60.0
+            )
+            if _should_log_tick:
+                log("scheduler_tick", sid=self.sid, current=current_pool, pick=pick,
+                    reason=_sched_reason, mode=_mode,
+                    time_on_pool=round(now - last_switch_ts, 1),
+                    worker=self.worker or "unknown")
+                self._last_scheduler_tick_log = _now_mono
+
+            # --- Switch execution (always runs when pick != current_pool) ---
+            # Don't switch into a pool until we have a cached job for it.
+            # Also, don't switch miners that are flagged as unable to handle
+            # en2_size changes -- they stay on whichever pool they handshaked on.
+
+            if pick != current_pool:
+                # If the assigner changed its mind about which pool to target,
+                # clear the pending-switch flag so we log the new skip event.
+                if self._switch_pending_pool and self._switch_pending_pool != pick:
+                    self._switch_pending_pool = ""
+                _skip_en2 = False
+                try:
+                    _peer = self.miner_w.get_extra_info("peername")
+                    if _peer and dpmp_fleet.en2_is_pinned(_peer[0]):
+                        # Pinned miners are blocked from switching unconditionally.
+                        # The pin means the miner can't handle pool changes
+                        # (en2 size mismatch or extranonce1 incompatibility).
+                        _skip_en2 = True
+                except Exception:
+                    pass
+
+                # If force_reconnect_on_en2_mismatch is enabled and the two
+                # pools have different en2 sizes, treat every switch like a
+                # pinned miner -- force a clean disconnect so the miner
+                # reconnects and handshakes fresh with the correct en2 size.
+                # This is needed for strict pools like PublicPool that silently
+                # drop shares with an oversized extranonce2.
+                if not _skip_en2 and self.cfg.sched.force_reconnect_on_en2_mismatch:
+                    _en2a = self.extranonce2_size.get("A")
+                    _en2b = self.extranonce2_size.get("B")
+                    if _en2a is not None and _en2b is not None and _en2a != _en2b:
+                        _skip_en2 = True
+                        log("en2_mismatch_force_reconnect_armed", sid=self.sid,
+                            from_pool=current_pool, to_pool=pick,
+                            en2a=_en2a, en2b=_en2b,
+                            worker=self.worker or "unknown")
+
+                if _skip_en2:
+                    # This miner can't handle extranonce changes in-session.
+                    # Instead of skipping the switch, force a clean disconnect.
+                    # The miner will reconnect and handshake directly with the
+                    # target pool, getting the correct extranonce from the start.
+                    # Safety: don't force-reconnect more than once per 30 seconds
+                    # to prevent rapid-fire disconnects if something goes wrong.
+                    _last_force_reconn = getattr(self, "_last_en2_force_reconnect_mono", 0.0)
+                    if now - _last_force_reconn < 30.0:
+                        last_switch_ts = now
+                        _last_en2_skip_log = getattr(self, "_last_en2_skip_log", 0.0)
+                        if now - _last_en2_skip_log >= 60.0:
+                            log("en2_force_reconnect_cooldown", sid=self.sid,
+                                from_pool=current_pool, to_pool=pick,
+                                cooldown_remaining=round(30.0 - (now - _last_force_reconn), 1))
+                            self._last_en2_skip_log = now
+
+                    else:
+                        try:
+                            dpmp_fleet.en2_set_hint(_peer[0], pick)
+                            self._last_en2_force_reconnect_mono = now
+                            # Count this as a switch so Fleet table stays accurate.
+
+                            _from_pool = current_pool
+                            self.active_pool = pick
+                            current_pool = pick
+                            last_switch_ts = now
+
+                            self.switch_count += 1
+                            self.last_switch_mono = time.monotonic()
+                            self._post_switch_accepts = 0
+                            self._post_switch_rejects = 0
+                            self._post_switch_en1_mismatch = 0
+                            self._slice_timer_started = False
+                            dpmp_fleet.fleet_register(str(self.sid), pick,
+                                            worker_name=self.worker or "unknown",
+                                            switch_count=self.switch_count,
+                                            last_switch_mono=self.last_switch_mono)
+                            log("pool_switched", sid=self.sid, to_pool=pick,
+                                via="en2_force_reconnect")
+
+                            log("en2_force_reconnect", sid=self.sid,
+                                from_pool=_from_pool, to_pool=pick,
+
+                                miner_ip=_peer[0],
+                                reason="miner flagged for en2 incompatibility, forcing reconnect to target pool")
+
+                            self._en2_force_reconnect_disconnect = True
+                            self.miner_w.close()
+                        except Exception as e:
+                            log("en2_force_reconnect_error", sid=self.sid, err=str(e))
+                        last_switch_ts = now
+
+                elif self.latest_notify_raw.get(pick) is None:
+                    # If the target pool is idle-disconnected, trigger an
+                    # on-demand reconnect so we can switch to it once ready.
+                    if self.pool_idle_disconnected.get(pick, False):
+                        log("pool_ondemand_reconnect_triggered", sid=self.sid,
+                            pool=pick, worker=self.worker or "unknown")
+                        self.pool_idle_disconnected[pick] = False
+                        self._pool_reconnect_mono[pick] = time.monotonic()
+                        # pool_reader_with_reconnect is waiting on this flag --
+                        # clearing it lets it fall through to Phase 3 (reconnect).
+                    else:
+                        # Only log and act on the FIRST skip -- after that, set
+                        # _switch_pending_pool and wait silently until pool_notify
+                        # arrives for the target pool.  Firing on every incoming
+                        # miner message creates a tight loop of 50+ log events
+                        # per second and hammers pool_record_no_job unnecessarily.
+                        if self._switch_pending_pool != pick:
+                            self._switch_pending_pool = pick
+                            log("switch_skipped_no_cached_job", sid=self.sid,
+                                from_pool=current_pool, to_pool=pick)
+                            # Track how long this pool has had no job -- declare
+                            # it unresponsive after _POOL_NO_JOB_FAILOVER_S so
+                            # the assigner can move miners to the working pool.
+                            dpmp_fleet.pool_record_no_job(pick, time.monotonic())
+                            # Re-arm reconnect if pool reconnected but never sent
+                            # a job (race condition: reconnect completed but
+                            # mining.notify hasn't arrived yet).  Wait 10s before
+                            # re-triggering to give the pool time to send a job.
+                            _last_reconnect = self._pool_reconnect_mono.get(pick, 0.0)
+                            if time.monotonic() - _last_reconnect > 10.0:
+                                log("pool_no_job_rearm_reconnect", sid=self.sid,
+                                    pool=pick, worker=self.worker or "unknown",
+                                    secs_since_reconnect=round(time.monotonic() - _last_reconnect, 1))
+                                self.pool_idle_disconnected[pick] = True
+                                self._pool_reconnect_mono[pick] = time.monotonic()
+
+                elif not dpmp_fleet.fleet_try_switch():
+                    # Another miner switched recently -- wait for cooldown.
+                    # Don't reset last_switch_ts here -- let the assigner's
+                    # timer-based logic handle retry timing naturally.
+                    pass
+                else:
+                    self.active_pool = pick
+                    ACTIVE_POOL.labels(pool="A").set(1 if pick == "A" else 0)
+                    ACTIVE_POOL.labels(pool="B").set(1 if pick == "B" else 0)
+                    current_pool = pick
+                    last_switch_ts = now
+                    self.switch_count += 1
+                    self.last_switch_mono = time.monotonic()
+                    # Open the stale-share grace window.  All stale/job-not-found
+                    # rejects within this window are suppressed -- miner pipelines
+                    # hold in-flight shares from the prior pool that will arrive
+                    # immediately after the switch and would otherwise cause ckpool
+                    # to ban the miner.
+                    self._switch_grace_end = time.monotonic() + self._SWITCH_GRACE_S
+                    # Clear the pending-switch flag -- switch completed.
+                    self._switch_pending_pool = ""
+                    dpmp_fleet.fleet_register(str(self.sid), pick,
+                                    worker_name=self.worker or "unknown",
+                                    switch_count=self.switch_count,
+                                    last_switch_mono=self.last_switch_mono)
+                    log("pool_switched", sid=self.sid, to_pool=pick)
+                    switched_this_tick = True
+
+                    # --- Health: start tracking this switch (Phase 1b) ---
+                    self._health_post_switch_rejects = 0
+                    self._health_post_switch_storm_fired = False
+                    self._health_clean_switch_pending = time.monotonic()
+
+                    self._post_switch_accepts = 0
+                    self._post_switch_rejects = 0
+                    self._post_switch_en1_mismatch = 0
+                    self._slice_timer_started = False
+
+                    # Immediately sync extranonce+diff and resend clean notify after switch.
+                    # resend_active_notify_clean() handles extranonce+diff+notify internally,
+                    # so we don't need separate calls here (avoids duplicate sends).
+                    await self.resend_active_notify_clean(pick, reason="switch")
+
+                pick = current_pool
+
+            pick = current_pool
+
+            # Soft-pause: if the GUI has toggled this miner off, skip notify
+            # forwarding.  The miner stays connected but stops getting new work.
+            # Shares from old work are still accepted (handled in submit path).
+            if self.worker and self.worker in get_paused_miners():
+                await asyncio.sleep(0.10)
+                continue
+
+            raw = self.latest_notify_raw.get(pick)
+            jid = self.latest_jobid.get(pick)
+            if raw is not None:
+                seq = int(self.notify_seq.get(pick, 0))
+
+                # Skip if we already sent everything during the switch block above.
+                # resend_active_notify_clean() already sent extranonce+diff+notify.
+                if switched_this_tick:
+                    last_sent_seq[pick] = seq
+                    JOBS_FORWARDED.labels(pool=pick).inc()
+                    self.last_forwarded_jobid = jid
+                    self.last_forwarded_pool = pick
+                    if not self._session_ready:
+                        self._session_ready = True
+                        log("session_ready", sid=self.sid, pool=pick, jobid=jid)
+                    if jid:
+                        self._commit_job(pick, jid)
+                    log("job_forwarded", sid=self.sid, pool=pick, jobid=jid, seq=seq)
+                    log("job_forwarded_diff_state", sid=self.sid, pool=pick, jobid=jid, latest_diff=self.latest_diff.get(pick), last_dd=self.last_downstream_diff_by_pool.get(pick))
+                elif seq > last_sent_seq.get(pick, 0):
+                    # Metrics truth: whichever pool we actually forward is 'active'.
+                    self.active_pool = pick
+                    ACTIVE_POOL.labels(pool="A").set(1 if pick == "A" else 0)
+                    ACTIVE_POOL.labels(pool="B").set(1 if pick == "B" else 0)
+                    # Ensure miner has correct extranonce/diff for this pool before notify
+                    await self.maybe_send_downstream_extranonce(pick)
+                    await self.maybe_send_downstream_diff(pick)
+                    if jid:
+                        self._commit_job(pick, jid)
+
+                    # Preserve upstream clean_jobs flag instead of forcing True.
+                    # Also removed 250ms sleep between diff and notify to eliminate
+                    # the rejection window for in-flight shares.
+                    try:
+                        nm = loads_json(raw)
+                        if nm.get("method") == "mining.notify":
+                            params = nm.get("params") or []
+                            if len(params) >= 1:
+                                # Pad to 9 params if needed, but preserve upstream clean flag
+                                if len(params) < 9:
+                                    while len(params) < 9:
+                                        params.append(False)
+                                # params[-1] left as-is (whatever upstream sent)
+                                nm["params"] = params
+                                nm2 = sanitize_downstream_notification(nm)
+                                raw2 = dumps_json(nm2)
+                                await self.maybe_send_downstream_extranonce(pick)
+                                await self.maybe_send_downstream_diff(pick, force=(pick != self.last_forwarded_pool))
+                                await write_line(self.miner_w, raw2, "downstream")
+                                log("notify_forwarded", sid=self.sid, pool=pick, jobid=jid,
+                                    clean_jobs=bool(params[-1]) if len(params) >= 9 else None)
+                            else:
+                                await self.maybe_send_downstream_extranonce(pick)
+                                await self.maybe_send_downstream_diff(pick, force=(pick != self.last_forwarded_pool))
+                                await write_line(self.miner_w, raw, "downstream")
+                        else:
+                            await self.maybe_send_downstream_extranonce(pick)
+                            await self.maybe_send_downstream_diff(pick, force=(pick != self.last_forwarded_pool))
+                            await write_line(self.miner_w, raw, "downstream")
+                    except Exception as e:
+                        log("notify_forward_error", sid=self.sid, pool=pick, err=str(e))
+                        await self.maybe_send_downstream_extranonce(pick)
+                        await self.maybe_send_downstream_diff(pick, force=(pick != self.last_forwarded_pool))
+                        await write_line(self.miner_w, raw, "downstream")
+
+
+
+                    last_sent_seq[pick] = seq
+                    JOBS_FORWARDED.labels(pool=pick).inc()
+                    self.last_forwarded_jobid = jid
+                    self.last_forwarded_pool = pick
+                    if not self._session_ready:
+                        self._session_ready = True
+                        log("session_ready", sid=self.sid, pool=pick, jobid=jid)
+                    log("job_forwarded", sid=self.sid, pool=pick, jobid=jid, seq=seq)
+                    log("job_forwarded_diff_state", sid=self.sid, pool=pick, jobid=jid, latest_diff=self.latest_diff.get(pick), last_dd=self.last_downstream_diff_by_pool.get(pick))
+
+            await asyncio.sleep(0.10)
+
+    # Main session runner
+    async def run(self):
+        tasks = set()
+
+        # Only connect to pools that have weight > 0.
+        # At 100/0, skip Pool B entirely (avoids crash if Pool B is unreachable).
+        # At 0/100, skip Pool A entirely.
+        if self.cfg.sched.wA > 0:
+            try:
+                self.rA, self.wA = await asyncio.wait_for(
+                    self.connect_pool(self.cfg.poolA), timeout=15.0)
+                self.pool_alive["A"] = True
+            except Exception as e:
+                # Pool A unreachable at startup -- not fatal.
+                # Mark dead and let the reconnect wrapper handle recovery.
+                log("pool_initial_connect_failed", sid=self.sid, pool="A", err=str(e))
+                self.pool_alive["A"] = False
+                self.pool_fail_count["A"] = 1
+                self.pool_last_fail_mono["A"] = time.monotonic()
+                # Create a dummy reader so pool_reader_with_reconnect
+                # skips straight to its reconnect loop.
+                self.rA = asyncio.StreamReader()
+                self.rA.feed_eof()  # immediately signals "disconnected"
+            tasks.add(asyncio.create_task(
+                self.pool_reader_with_reconnect("A", self.rA)))
+        else:
+            self.pool_alive["A"] = False
+            log("pool_skipped_zero_weight", pool="A", wA=self.cfg.sched.wA)
+
+        if self.cfg.sched.wB > 0:
+            try:
+                self.rB, self.wB = await asyncio.wait_for(
+                    self.connect_pool(self.cfg.poolB), timeout=15.0)
+                self.pool_alive["B"] = True
+            except Exception as e:
+                log("pool_initial_connect_failed", sid=self.sid, pool="B", err=str(e))
+                self.pool_alive["B"] = False
+                self.pool_fail_count["B"] = 1
+                self.pool_last_fail_mono["B"] = time.monotonic()
+                self.rB = asyncio.StreamReader()
+                self.rB.feed_eof()
+            tasks.add(asyncio.create_task(
+                self.pool_reader_with_reconnect("B", self.rB)))
+        else:
+            self.pool_alive["B"] = False
+            log("pool_skipped_zero_weight", pool="B", wB=self.cfg.sched.wB)
+
+        tasks.add(asyncio.create_task(self.miner_to_pools()))
+        tasks.add(asyncio.create_task(self.forward_jobs()))
+
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        for t in pending:
+            t.cancel()
+        for t in done:
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    raise exc
+
+
+    # Close all connections
+    async def close(self):
+        try:
+            self.miner_w.close()
+            await self.miner_w.wait_closed()
+        except Exception:
+            pass
+        for w in (self.wA, self.wB):
+            if w is not None:
+                try:
+                    w.close()
+                    await w.wait_closed()
+                except Exception:
+                    pass
+
+# Handle incoming miner connection
+async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, cfg: AppCfg):
+    peer = writer.get_extra_info("peername")
+
+    # Allow multiple miners to connect concurrently.
+
+    CONN_DOWNSTREAM.inc()
+    _active_miner_writers.add(writer)
+    log("miner_connected", peer=str(peer))
+
+    sess = ProxySession(cfg, reader, writer, sid=str(peer))
+    try:
+        await sess.run()
+    except Exception as e:
+        log("session_error", peer=str(peer), err=str(e))
+    finally:
+
+        # --- Health: disconnect within 10s of switch (Phase 1b) ---
+        # If the miner disconnects very shortly after a pool switch, the
+        # switch may have caused a crash/reboot.  Penalize the health score.
+        try:
+            _wn = getattr(sess, "worker", "") or "unknown"
+            _lsm = getattr(sess, "last_switch_mono", None)
+            if _wn != "unknown" and _lsm is not None:
+                _since_switch = time.monotonic() - _lsm
+
+                if _since_switch < 10.0:
+                    if getattr(sess, "_en2_force_reconnect_disconnect", False):
+                        # Intentional force reconnect -- not a crash.
+                        # Skip the health penalty.
+                        log("health_disconnect_skipped_force_reconnect", peer=str(peer),
+                            worker=_wn, seconds_since_switch=round(_since_switch, 1))
+                    else:
+                        dpmp_fleet.health_event(_wn, 0.0, "disconnect_after_switch")
+                        log("health_disconnect_near_switch", peer=str(peer),
+                            worker=_wn, seconds_since_switch=round(_since_switch, 1))
+
+                else:
+                    # General disconnect (not switch-related).  Mild penalty
+                    # so miners that disconnect frequently (e.g. BM101) show
+                    # degraded health, alerting the user to misbehavior.
+                    # Score 0.5 with ALPHA=0.1 means each disconnect nudges
+                    # health down by ~5% of the gap to 0.5.
+                    dpmp_fleet.health_event(_wn, 0.5, "general_disconnect")
+            elif _wn != "unknown":
+                # No last_switch_mono means miner never switched -- still a
+                # disconnect, so apply mild penalty.
+                dpmp_fleet.health_event(_wn, 0.5, "general_disconnect")
+        except Exception:
+            pass
+
+        # Clear per-session downstream state so reconnects start clean.
+        try:
+            sess.last_downstream_diff_by_pool = {"A": None, "B": None}
+            sess.last_downstream_en1 = None
+            sess.last_downstream_en2s = None
+            sess.last_downstream_extranonce = None
+        except Exception:
+            pass
+
+        CONN_DOWNSTREAM.dec()
+        _active_miner_writers.discard(writer)
+        CONN_UPSTREAM.labels(pool="A").dec()
+        CONN_UPSTREAM.labels(pool="B").dec()
+
+        # Remove miner from fleet tracking (Phase 1c)
+        try:
+            # en1 mismatch carry save disabled -- grace period makes it
+            # unnecessary and carrying caused false pins across sessions.
+            dpmp_fleet.fleet_unregister(str(sess.sid))
+        except Exception:
+            pass
+
+        await sess.close()
+        log("miner_disconnected", peer=str(peer))
+
+# Main entry point
+async def main():
+    global WEIGHTS_OVERRIDE_PATH, ORACLE_MODE_PATH, MINER_PAUSED_PATH
+    cfg_path = os.environ.get("DPMP_CONFIG", os.path.join(os.path.dirname(__file__), "config_v2.json"))
+
+    WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(cfg_path), "weights_override.json")
+    ORACLE_MODE_PATH = os.path.join(os.path.dirname(cfg_path), "oracle_mode.json")
+    MINER_PAUSED_PATH = os.path.join(os.path.dirname(cfg_path), "miner_paused.json")
+
+    # Reset all miners to "on" on startup by removing the pause file.
+    try:
+        os.remove(MINER_PAUSED_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    # --- Stats tab: set up file paths and initialize fleet module ---
+    _data_dir = os.path.dirname(cfg_path)
+    _worker_stats_path = os.path.join(_data_dir, "worker_stats.json")
+    _best_shares_path = os.path.join(_data_dir, "best_shares.json")
+    _fleet_health_path = os.path.join(_data_dir, "fleet_health.json")
+    _fleet_metrics_path = os.path.join(_data_dir, "fleet_metrics.json")
+    _scheduler_diag_path = os.path.join(_data_dir, "scheduler_diag.csv")
+    _manual_mode_path = os.path.join(_data_dir, "manual_mode.json")
+    _pinned_assignments_path = os.path.join(_data_dir, "pinned_assignments.json")
+
+    # Wire up the fleet module with all its dependencies
+    dpmp_fleet.init(
+        log_fn=log,
+        read_weights_fn=read_weight_override,
+        read_oracle_fn=read_oracle_mode,
+        health_gauge=MINER_HEALTH,
+        worker_stats_path=_worker_stats_path,
+        best_shares_path=_best_shares_path,
+        fleet_health_path=_fleet_health_path,
+        fleet_metrics_path=_fleet_metrics_path,
+        scheduler_diag_path=None,  # disabled -- set to _scheduler_diag_path to re-enable
+        get_paused_fn=get_paused_miners,
+        manual_mode_path=_manual_mode_path,
+        pinned_assignments_path=_pinned_assignments_path,
+    )
+    dpmp_fleet.load_best_shares()
+    # Health scores are intentionally NOT loaded on startup -- all miners
+    # start fresh at 1.0.  Loading persisted scores would carry over damage
+    # from reject storms in the previous session, causing miners to start
+    # in a degraded state even after a clean restart.
+    # dpmp_fleet.load_fleet_health()
+
+    # Start background thread that writes worker_stats.json every 5 seconds
+    _stats_writer = threading.Thread(target=dpmp_fleet.worker_stats_write_loop_sync, daemon=True)
+    _stats_writer.start()
+    log("worker_stats_writer_started", stats_path=_worker_stats_path, best_shares_path=_best_shares_path)
+
+    # Delete oracle_mode.json on startup so config auto_balance is the default.
+    # The file is only created when the GUI switch button is clicked at runtime.
+    try:
+        if os.path.isfile(ORACLE_MODE_PATH):
+            os.remove(ORACLE_MODE_PATH)
+            log("oracle_mode_file_deleted_on_startup")
+    except Exception:
+        pass
+
+    # Clear oracle chart history on startup so GUI charts begin fresh
+    _chart_hist = os.path.join(os.path.dirname(cfg_path), "oracle_chart_history.json")
+    try:
+        if os.path.isfile(_chart_hist):
+            os.remove(_chart_hist)
+    except Exception:
+        pass
+
+    cfg = load_config(cfg_path)
+
+    # Now that cfg is loaded, pass pool_failover_seconds to the fleet module
+    dpmp_fleet.init_pool_failover(cfg.sched.pool_failover_seconds)
+
+    # Log normalized scheduler targets (weights need not sum to 100; they are relative ratios).
+    try:
+        wA = max(0, int(getattr(cfg.sched, "wA", 0)))
+    except Exception:
+        wA = 0
+    try:
+        wB = max(0, int(getattr(cfg.sched, "wB", 0)))
+    except Exception:
+        wB = 0
+    totw = wA + wB
+    if totw > 0:
+        targetA = wA / totw
+        targetB = wB / totw
+    else:
+        targetA = None
+        targetB = None
+    log("weights_normalized", wA=wA, wB=wB, weights_raw=f"{getattr(cfg.sched, 'wA', None)}:{getattr(cfg.sched, 'wB', None)}", targetA=targetA, targetB=targetB)
+    log("config_loaded", config=cfg_path, listen_host=cfg.listen_host, listen_port=cfg.listen_port, metrics_enabled=cfg.metrics_enabled, metrics_host=cfg.metrics_host, metrics_port=cfg.metrics_port)
+
+    # Start metrics server
+    if cfg.metrics_enabled:
+        try:
+            start_http_server(cfg.metrics_port, addr=cfg.metrics_host)
+            log("metrics_started", host=cfg.metrics_host, port=cfg.metrics_port)
+        except OSError as e:
+            # Do not crash the proxy if metrics port is already in use.
+            log("metrics_start_failed", host=cfg.metrics_host, port=cfg.metrics_port, err=str(e))
+
+    # Start listening for miners
+    server = await asyncio.start_server(lambda r, w: handle_miner(r, w, cfg), cfg.listen_host, cfg.listen_port)
+    # Log listening addresses
+    addrs = ", ".join(str(sock.getsockname()) for sock in (server.sockets or []))
+    log(
+        "dpmp_listening",
+        addrs=addrs,
+        config=cfg_path,
+        upstreamA=f"{cfg.poolA.host}:{cfg.poolA.port}",
+        upstreamB=f"{cfg.poolB.host}:{cfg.poolB.port}",
+        mode="dual_pool_scheduling_handshake_forward",
+        weights=f"{cfg.sched.wA}:{cfg.sched.wB}",
+    )
+
+    stop = asyncio.Event()
+    def _stop(*_args):
+        # Sync breadcrumb to confirm signal was received (survives log truncation)
+        try:
+            with open("/data/shutdown_breadcrumb.txt", "w") as _bf:
+                _bf.write(f"SIGTERM received at {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+        except Exception:
+            pass
+        log("shutdown_signal")
+        # Thread-safe: call_soon_threadsafe works even if signal arrives
+        # outside the event loop's thread.
+        try:
+            loop.call_soon_threadsafe(stop.set)
+        except Exception:
+            stop.set()
+
+    loop = asyncio.get_running_loop()
+    # Use signal.signal() instead of loop.add_signal_handler() to guarantee
+    # the handler fires even if the event loop is busy or blocked.
+    prev_term = signal.signal(signal.SIGTERM, _stop)
+    prev_int = signal.signal(signal.SIGINT, _stop)
+
+    # Keep running until stopped
+    serve_task = asyncio.create_task(server.serve_forever())
+
+    # Start oracle task if chain config is valid (one BTC + one BCH pool).
+    # The oracle ALWAYS runs to collect data and update Prometheus gauges.
+    # Whether it actually writes weights_override.json depends on oracle_mode.json
+    # (checked inside oracle_poll_loop each cycle).
+    oracle_task = None
+    chain_a = getattr(cfg.poolA, "chain", "").upper()
+    chain_b = getattr(cfg.poolB, "chain", "").upper()
+    chain_valid = sorted([chain_a, chain_b]) == ["BCH", "BTC"]
+    if chain_valid:
+        oracle_task = asyncio.create_task(oracle_poll_loop(cfg))
+        log("oracle_task_started", auto_balance=cfg.sched.auto_balance,
+            reason="chain config valid, oracle always collects data")
+    else:
+        log("oracle_disabled_invalid_chains", chain_a=chain_a, chain_b=chain_b,
+            reason="need exactly one BTC and one BCH pool for oracle")
+
+    # Start v3 global assigner (Phase 2 -- advisory only, does not change behavior)
+    assigner_task = asyncio.create_task(dpmp_fleet.assigner_loop(cfg))
+    log("assigner_task_started",
+        interval_s=cfg.sched.assigner_interval_seconds,
+        min_slice_s=cfg.sched.min_slice_seconds)
+
+    try:
+        await stop.wait()
+    finally:
+        log("shutdown_begin")
+
+        # Close all active miner connections FIRST so miners disconnect,
+        # flush stale work, and reconnect fresh when DPMP restarts.
+        if _active_miner_writers:
+            log("shutdown_closing_miners", count=len(_active_miner_writers))
+            for w in list(_active_miner_writers):
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            # Brief pause to let TCP FIN packets reach miners
+            await asyncio.sleep(0.5)
+            log("shutdown_miners_closed")
+            try:
+                with open("/data/shutdown_breadcrumb.txt", "a") as _bf:
+                    _bf.write(f"Miners closed ({len(_active_miner_writers)}) at {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+            except Exception:
+                pass
+
+        try:
+            log("shutdown_server_close_begin")
+            server.close()
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+                log("shutdown_server_close_done")
+            except asyncio.TimeoutError:
+                log("shutdown_server_close_timeout")
+        except Exception as e:
+            log("shutdown_server_close_error", err=str(e))
+
+        # Stop the serve_forever loop        
+        log("shutdown_serve_task_cancel_begin")
+        try:
+            serve_task.cancel()
+            await asyncio.wait_for(asyncio.gather(serve_task, return_exceptions=True), timeout=2.0)
+            log("shutdown_serve_task_cancel_done")
+        except asyncio.TimeoutError:
+            log("shutdown_serve_task_cancel_timeout")
+        except Exception as e:
+            log("shutdown_serve_task_error", err=str(e))
+
+        log("shutdown_cancel_tasks")
+        if oracle_task is not None and not oracle_task.done():
+            oracle_task.cancel()
+            log("oracle_task_cancelled")
+        current_task = asyncio.current_task()
+        tasks = [t for t in asyncio.all_tasks() if t is not current_task and t is not serve_task and not t.done()]
+
+        for t in tasks:
+            t.cancel()
+
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                log("shutdown_timeout", n=len(tasks))
+
+        log("shutdown_done")
+
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("shutdown_keyboard_interrupt")
+    except Exception as e:
+        log("fatal_crash", err=str(e), err_type=type(e).__name__)
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        log("process_exiting")
