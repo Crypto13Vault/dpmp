@@ -320,6 +320,7 @@ class SchedulerCfg:
     pool_failover_seconds: float = 90.0   # seconds of no-job before declaring pool unresponsive
     force_reconnect_on_en2_mismatch: bool = False  # force reconnect when pools have different en2 sizes
     sr_recruit_exclusions: list = None  # worker names excluded from SR dynamic slicer recruitment
+    downstream_keepalive_seconds: float = 0.0  # re-send last job as clean_jobs=false ping to keep miners alive (0=disabled)
 
     def __post_init__(self):
         if self.sr_recruit_exclusions is None:
@@ -1005,6 +1006,8 @@ class ProxySession:
         self.last_downstream_en1: Optional[str] = None
 
         self.last_downstream_en2s: Optional[int] = None
+
+        self._last_forward_mono: float = 0.0
 
         # Layer 2: Difficulty coalescing -- suppress rapid/minor diff changes
         # from aggressive VarDiff pools like MiningCore.
@@ -3782,11 +3785,31 @@ class ProxySession:
                     JOBS_FORWARDED.labels(pool=pick).inc()
                     self.last_forwarded_jobid = jid
                     self.last_forwarded_pool = pick
+                    self._last_forward_mono = time.monotonic()
                     if not self._session_ready:
                         self._session_ready = True
                         log("session_ready", sid=self.sid, pool=pick, jobid=jid)
                     log("job_forwarded", sid=self.sid, pool=pick, jobid=jid, seq=seq)
                     log("job_forwarded_diff_state", sid=self.sid, pool=pick, jobid=jid, latest_diff=self.latest_diff.get(pick), last_dd=self.last_downstream_diff_by_pool.get(pick))
+
+            # Downstream keepalive: re-send last notify as clean_jobs=false ping
+            ka = self.cfg.sched.downstream_keepalive_seconds
+            if ka > 0 and (time.monotonic() - self._last_forward_mono) >= ka:
+                raw = self.latest_notify_raw.get(current_pool)
+                if raw:
+                    try:
+                        msg = loads_json(raw)
+                        if msg.get("method") == "mining.notify":
+                            params = msg.get("params") or []
+                            if len(params) >= 9:
+                                params[-1] = False
+                                msg["params"] = params
+                                await write_line(self.miner_w, dumps_json(msg), "downstream")
+                                log("downstream_keepalive", sid=self.sid, pool=current_pool,
+                                    interval=ka)
+                                self._last_forward_mono = time.monotonic()
+                    except Exception as e:
+                        log("downstream_keepalive_error", sid=self.sid, err=str(e))
 
             await asyncio.sleep(0.10)
 
